@@ -4399,9 +4399,12 @@ static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t gg
 static void ggml_d3d11_enumerate(ggml_backend_d3d11_reg_context & reg_ctx, ggml_backend_reg_t reg) {
     // off unless asked for, so that a box with both backends keeps running D3D12 alone.
     // GGML_D3D12_DISABLE turns it on too: with D3D12 off, D3D11 takes its place.
+    // A build without the D3D12 backend has it on by default.
+#ifndef GGML_D3D11_DEFAULT_ON
     if (getenv("GGML_D3D11_ENABLE") == nullptr && getenv("GGML_D3D12_DISABLE") == nullptr) {
         return;
     }
+#endif
     if (getenv("GGML_D3D11_DISABLE") != nullptr) {
         return;
     }

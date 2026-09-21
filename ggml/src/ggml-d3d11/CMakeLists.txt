@@ -38,3 +38,8 @@ add_dependencies(ggml-d3d11 generate_d3d11_shaders)
 target_compile_features(ggml-d3d11 PRIVATE cxx_std_17)
 target_include_directories(ggml-d3d11 PRIVATE ${SHADER_OUTPUT_DIR})
 target_link_libraries(ggml-d3d11 PRIVATE d3d11 dxgi dxguid d3dcompiler_47)
+
+# without the D3D12 backend there is nothing to step aside for: D3D11 is on by default
+if (NOT GGML_D3D12)
+    target_compile_definitions(ggml-d3d11 PRIVATE GGML_D3D11_DEFAULT_ON)
+endif()
