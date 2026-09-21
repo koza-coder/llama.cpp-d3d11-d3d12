@@ -83,9 +83,16 @@ cbuffer Params : register(b0) {
 // share one block (head sizes are multiples of 32)
 float4 load_q8_0_4(RWByteAddressBuffer buf, uint i) {
     const uint byte = (i / 32u) * 34u;
-    uint dbits, w;
+    uint dbits;
     LOAD_U16_UNALIGNED(buf, byte, dbits);
-    LOAD_U32_UNALIGNED(buf, byte + 2u + i % 32u, w);
+    // the 4 quants start at an even byte, so they are either 4-byte aligned or 2 bytes past it. Not
+    // LOAD_U32_UNALIGNED: with its masked form the R9700 gave wrong results and page faults for head
+    // sizes 256 and 576 (2026-09-19); why is not known.
+    const uint a = byte + 2u + i % 32u;
+    uint w = buf.Load(a & ~3u);
+    if ((a & 2u) != 0u) {
+        w = (w >> 16) | (buf.Load((a & ~3u) + 4u) << 16);
+    }
     const int4 q = (int4) (uint4(w << 24, w << 16, w << 8, w)) >> 24;
     return f16tof32(dbits) * (float4) q;
 }
@@ -190,11 +197,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     const uint i1  = (row % (n_q * n_head)) / n_head;
     const uint i2  = row % n_head;
 
-    float4 q[DK / 4];
     const uint q_base = offset_q + i3 * stride_q3 + i2 * stride_q2 + i1 * stride_q1;
+#if defined(GGML_D3D11)
+    // D3D11: q is read again for each KV entry, so fewer registers are in use. With q in registers the
+    // R9700 gave NaN in acc[16] now and then (hsv=128); probably a register spill problem in the driver.
+#define Q4(a) asfloat(q_buf.Load4((q_base + 4 * (a)) * 4))
+#else
+    float4 q[DK / 4];
     for (uint a = 0; a < DK / 4; a++) {
         q[a] = asfloat(q_buf.Load4((q_base + 4 * a) * 4));
     }
+#define Q4(a) q[a]
+#endif
     const uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
     const uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
 
@@ -232,11 +246,16 @@ void main(uint3 id : SV_DispatchThreadID) {
 #endif
         float s = 0.0f;
         for (uint a = 0; a < DK / 4; a++) {
-            s += dot(q[a], load_k4(kj + 4 * a));
+            s += dot(Q4(a), load_k4(kj + 4 * a));
         }
         s *= scale;
 #if defined(SOFTCAP)
+#if defined(GGML_D3D11)
+        // tanh of a large input can give NaN (inf / inf); tanh is 1.0f past 9.01 anyway, as in unary.hlsl
+        s = logit_softcap * tanh(clamp(s, -9.010913f, 9.010913f));
+#else
         s = logit_softcap * tanh(s);
+#endif
 #endif
         s += mv;
 

@@ -229,6 +229,7 @@ option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"    
 option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
 option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)
 option(GGML_D3D12                           "ggml: use Direct3D 12"                           OFF)
+option(GGML_D3D11                           "ggml: use Direct3D 11"                           OFF)
 option(GGML_D3D12_DEBUG                     "ggml: enable Direct3D 12 debug layer/output"     OFF)
 option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)
@@ -342,6 +343,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-d3d12.h
+    include/ggml-d3d11.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
     include/gguf.h)

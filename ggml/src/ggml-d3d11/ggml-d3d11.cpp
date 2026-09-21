@@ -1,17 +1,17 @@
-// ggml Direct3D 12 backend
+// ggml Direct3D 11 backend
 //
-// Design (see docs/build.md, "D3D12"):
-//  - every tensor lives in a DEFAULT-heap buffer bound through root UAV descriptors (no descriptor heaps)
-//  - kernel parameters go through a persistently mapped UPLOAD-heap arena bound as a root CBV
-//  - HLSL is embedded as source and compiled at runtime with dxcompiler.dll (+ dxil.dll for signing)
-//  - execution is synchronous: one direct queue, one command list, fence wait after every submit
+// A port of the D3D12 backend to D3D11, for GPUs and drivers where D3D12 is missing or broken:
+//  - the op encoders and the HLSL kernels are the D3D12 backend's; kernels compile at runtime to cs_5_0
+//    with d3dcompiler_47.dll (FXC), which is part of Windows
+//  - every tensor buffer gets a fake GPU address; a dispatch turns each address into a cached raw UAV
+//  - one immediate context, no explicit barriers (D3D11 orders dependent dispatches itself)
 
-#include "ggml-d3d12.h"
+#include "ggml-d3d11.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
-#include "ggml-d3d12-shaders.hpp"
+#include "ggml-d3d11-shaders.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -20,9 +20,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <d3d12.h>
+#include <d3d11_1.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
-#include <dxcapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -38,36 +38,37 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef GGML_D3D12_DEBUG
-#define D3D12_LOG_DEBUG(...) GGML_LOG_DEBUG("ggml_d3d12: " __VA_ARGS__)
+#ifdef GGML_D3D11_DEBUG
+#define D3D11_LOG_DEBUG(...) GGML_LOG_DEBUG("ggml_d3d11: " __VA_ARGS__)
 #else
-#define D3D12_LOG_DEBUG(...)
+#define D3D11_LOG_DEBUG(...)
 #endif
 
 // Below 16 columns the matvec kernel is as fast or faster (MTT S80 pp8 -9%, R9700 pp2 -27%, 2026-09-21)
-#ifndef GGML_D3D12_TILED_DEFAULT
-#define GGML_D3D12_TILED_DEFAULT    16
+#ifndef GGML_D3D11_TILED_DEFAULT
+#define GGML_D3D11_TILED_DEFAULT    16
 #endif
-#define D3D12_WG_SIZE               256
-#define D3D12_MAX_WG_PER_DIM        65535
-#define D3D12_MAX_ROOT_UAVS         12   // 2 DWORDs each in the root signature
-#define D3D12_BINDING_ALIGNMENT     256   // root CBV alignment, also used for tensor UAV base addresses
-#define D3D12_PARAM_SLOT_SIZE       256
-#define D3D12_PARAM_SLOT_COUNT      8192
-#define D3D12_QUERY_CAPACITY        (2 * D3D12_PARAM_SLOT_COUNT)
-#define D3D12_STAGING_SIZE          (64ull * 1024 * 1024)
-#define D3D12_MEMSET_BYTES_PER_THREAD 16
+#define D3D11_WG_SIZE               256
+#define D3D11_MAX_WG_PER_DIM        65535
+#define D3D11_MAX_ROOT_UAVS         12   // 2 DWORDs each in the root signature
+#define D3D11_VA_WRITTEN            (1ull << 62)   // tag bit on a binding address: the dispatch writes this tensor
+#define D3D11_BINDING_ALIGNMENT     256   // root CBV alignment, also used for tensor UAV base addresses
+#define D3D11_PARAM_SLOT_SIZE       256
+#define D3D11_PARAM_SLOT_COUNT      8192
+#define D3D11_QUERY_CAPACITY        (2 * D3D11_PARAM_SLOT_COUNT)
+#define D3D11_STAGING_SIZE          (64ull * 1024 * 1024)
+#define D3D11_MEMSET_BYTES_PER_THREAD 16
 // Windows moves whole buffers to system memory when a process is over its VRAM budget. With 256 MiB
 // buffers less of the hot data moved (MTT S80, a 13.7 GB model over a 13 GB budget: tg32 5.5 -> 8.5 t/s).
-#define D3D12_DEFAULT_MAX_ALLOC     (256ull * 1024 * 1024)
-#define D3D12_DEFAULT_SUBMIT_BATCH  64    // dispatches per command list (GGML_D3D12_SUBMIT_BATCH)
+#define D3D11_DEFAULT_MAX_ALLOC     (256ull * 1024 * 1024)
+#define D3D11_DEFAULT_SUBMIT_BATCH  64    // dispatches per command list (GGML_D3D11_SUBMIT_BATCH)
 
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 // work budget per submission for kernels with long per-thread loops (flash attention, gated delta net,
 // argsort): small enough that one command list stays well inside the Windows GPU timeout on slow cards
-#define D3D12_FLASH_ATTN_WORK (1ull << 25)
-#define D3D12_FLASH_ATTN_BLK      32                    // KV entries per flash attention block thread
-#define D3D12_FLASH_ATTN_TMP_MAX  (64ull * 1024 * 1024)   // cap on the block results buffer
+#define D3D11_FLASH_ATTN_WORK (1ull << 25)
+#define D3D11_FLASH_ATTN_BLK      32                    // KV entries per flash attention block thread
+#define D3D11_FLASH_ATTN_TMP_MAX  (64ull * 1024 * 1024)   // cap on the block results buffer
 
 /* Minimal COM smart pointer (avoids a WRL dependency for MinGW builds) */
 
@@ -94,7 +95,7 @@ template <typename T> struct com_ptr {
     explicit operator bool() const { return p != nullptr; }
 };
 
-static double ggml_d3d12_time_us() {
+static double ggml_d3d11_time_us() {
     static LARGE_INTEGER freq = {};
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);
@@ -104,14 +105,14 @@ static double ggml_d3d12_time_us() {
     return (double) now.QuadPart * 1e6 / (double) freq.QuadPart;
 }
 
-static void ggml_d3d12_check(HRESULT hr, const char * what) {
+static void ggml_d3d11_check(HRESULT hr, const char * what) {
     if (FAILED(hr)) {
-        GGML_LOG_ERROR("ggml_d3d12: %s failed with HRESULT 0x%08lx\n", what, (unsigned long) hr);
-        GGML_ABORT("ggml_d3d12: %s failed", what);
+        GGML_LOG_ERROR("ggml_d3d11: %s failed with HRESULT 0x%08lx\n", what, (unsigned long) hr);
+        GGML_ABORT("ggml_d3d11: %s failed", what);
     }
 }
 
-static std::string ggml_d3d12_wide_to_utf8(const wchar_t * w) {
+static std::string ggml_d3d11_wide_to_utf8(const wchar_t * w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     std::string s(n > 0 ? n - 1 : 0, '\0');
     if (n > 1) {
@@ -120,7 +121,7 @@ static std::string ggml_d3d12_wide_to_utf8(const wchar_t * w) {
     return s;
 }
 
-static std::wstring ggml_d3d12_utf8_to_wide(const std::string & s) {
+static std::wstring ggml_d3d11_utf8_to_wide(const std::string & s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n > 0 ? n - 1 : 0, L'\0');
     if (n > 1) {
@@ -131,71 +132,88 @@ static std::wstring ggml_d3d12_utf8_to_wide(const std::string & s) {
 
 // All device buffers report the same fake host base pointer; a tensor's byte offset inside its
 // buffer is recovered from tensor->data (same scheme as the WebGPU backend).
-static void * const d3d12_ptr_base = (void *) (uintptr_t) 0x1000;  // NOLINT
+static void * const d3d11_ptr_base = (void *) (uintptr_t) 0x1000;  // NOLINT
 
-static size_t ggml_d3d12_tensor_offset(const ggml_tensor * tensor) {
+static size_t ggml_d3d11_tensor_offset(const ggml_tensor * tensor) {
     const ggml_tensor * base_tensor = tensor->view_src ? tensor->view_src : tensor;
-    return (size_t) ((uintptr_t) base_tensor->data - (uintptr_t) d3d12_ptr_base) + tensor->view_offs;
+    return (size_t) ((uintptr_t) base_tensor->data - (uintptr_t) d3d11_ptr_base) + tensor->view_offs;
 }
 
 /* Structs */
 
-struct d3d12_caps {
+// the D3D12 op encoders pass GPU addresses and shader model levels; D3D11 has neither, so both are emulated
+typedef uint64_t D3D11_GPU_VIRTUAL_ADDRESS;
+enum D3D_SHADER_MODEL { D3D_SHADER_MODEL_6_0 = 0x60 };
+enum d3d11_heap_type { D3D11_HEAP_TYPE_DEFAULT };
+
+struct d3d11_caps {
     D3D_SHADER_MODEL shader_model = D3D_SHADER_MODEL_6_0;
-    bool             native_16bit = false;
+    bool             native_16bit = true;    // f16 loads and stores are emulated with 32-bit words
     bool             wave_ops     = false;
     uint32_t         wave_min     = 0;
     uint32_t         wave_max     = 0;
     bool             uma          = false;
 };
 
-struct d3d12_pipeline {
-    com_ptr<ID3D12PipelineState> pso;
+struct d3d11_pipeline {
+    com_ptr<ID3D11ComputeShader> cs;
     std::string                  name;
 };
 
-struct d3d12_device_ctx {
-    std::string name;   // "D3D120"
+struct d3d11_device_ctx;
+
+// a device buffer with a fake GPU address; reference counted so that com_ptr can hold it
+struct d3d11_res {
+    std::atomic<long>     refs{ 1 };
+    d3d11_device_ctx *    dev  = nullptr;
+    com_ptr<ID3D11Buffer> buf;
+    uint64_t              va   = 0;
+    size_t                size = 0;
+
+    void     AddRef() { refs++; }
+    void     Release();
+    uint64_t GetGPUVirtualAddress() const { return va; }
+};
+
+struct d3d11_device_ctx {
+    std::string name;   // "D3D110"
     std::string desc;   // adapter description
     uint32_t    vendor_id     = 0;
     size_t      dedicated_mem = 0;
     size_t      shared_mem    = 0;
-    size_t      max_alloc     = D3D12_DEFAULT_MAX_ALLOC;
-    d3d12_caps  caps;
+    size_t      max_alloc     = D3D11_DEFAULT_MAX_ALLOC;
+    d3d11_caps  caps;
 
-    com_ptr<IDXGIAdapter1>            adapter;
-    com_ptr<ID3D12Device>             device;
-    com_ptr<ID3D12CommandQueue>       queue;
-    com_ptr<ID3D12CommandAllocator>   allocator;
-    com_ptr<ID3D12GraphicsCommandList> cmd_list;
-    com_ptr<ID3D12Fence>              fence;
-    uint64_t                          fence_value = 0;
-    HANDLE                            fence_event = nullptr;
-    com_ptr<ID3D12RootSignature>      root_sig;
+    com_ptr<IDXGIAdapter1>       adapter;
+    com_ptr<ID3D11Device>        device;
+    com_ptr<ID3D11DeviceContext> ctx;
+    com_ptr<ID3D11Buffer>        cbuf;        // kernel parameters, rewritten before every dispatch
+    com_ptr<ID3D11Query>         done_query;  // event query for submit_and_wait
+    uint32_t                     max_uavs = 8;
+    com_ptr<ID3D11InfoQueue>     info;        // debug layer messages, with GGML_D3D11_DEBUG
+
+    // fake address space: buffer base -> buffer, and address -> raw UAV starting there
+    uint64_t                                                          next_va = 1ull << 40;
+    std::map<uint64_t, d3d11_res *>                                   res_map;
+    std::map<std::pair<uint64_t, uint64_t>, com_ptr<ID3D11UnorderedAccessView>> uavs;   // (start, end)
+    std::unordered_map<uint64_t, uint64_t> bind_end;   // start -> end of the tensors bound for the next dispatch
+    // outputs of the nodes being encoded: a dispatch at node i can only write nodes i and after (fused ones)
+    const ggml_tensor *                    out_nodes[8] = {};
+    com_ptr<d3d11_res> alias_copy[D3D11_MAX_ROOT_UAVS];   // per slot: copy of a slot that shares a buffer
 
     // staging for set/get tensor
-    com_ptr<ID3D12Resource> upload_buf;
-    void *                  upload_ptr = nullptr;
-    com_ptr<ID3D12Resource> readback_buf;
+    com_ptr<ID3D11Buffer> readback_buf;
 
     // flash attention block results, grown on demand
-    com_ptr<ID3D12Resource> fa_tmp;
-    size_t                  fa_tmp_size = 0;
-    uint64_t                fa_work     = D3D12_FLASH_ATTN_WORK;   // adapted to the measured submit time
+    com_ptr<d3d11_res> fa_tmp;
+    size_t             fa_tmp_size = 0;
+    uint64_t           fa_work     = D3D11_FLASH_ATTN_WORK;   // adapted to the measured submit time
+    bool               fa_work_fixed = false;                 // GGML_D3D11_FA_WORK: no adaptation
 
-    // parameter arena (root CBV slots)
-    com_ptr<ID3D12Resource>   param_buf;
-    uint8_t *                 param_ptr = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS param_va  = 0;
-    uint32_t                  param_next_slot = 0;
-    uint32_t                  submit_batch    = D3D12_DEFAULT_SUBMIT_BATCH;
-    uint32_t                  dispatches_in_list = 0;
+    uint32_t submit_batch       = D3D11_DEFAULT_SUBMIT_BATCH;
+    uint32_t dispatches_in_list = 0;
 
-    // shader compiler
-    HMODULE                 dxc_module = nullptr;
-    com_ptr<IDxcCompiler3>  compiler;
-    com_ptr<IDxcUtils>      utils;
-    std::unordered_map<std::string, d3d12_pipeline> pipelines;
+    std::unordered_map<std::string, d3d11_pipeline> pipelines;
 
     // parallel compilation: a collect pass over a new graph queues the missing pipelines, worker threads build them
     struct pipeline_job {
@@ -206,12 +224,12 @@ struct d3d12_device_ctx {
     };
     bool                      collecting       = false;
     std::vector<pipeline_job> pipeline_jobs;
-    std::mutex                pipelines_mutex;   // guards pipelines and the compile counters while workers run
+    std::mutex                pipelines_mutex;
     int                       last_graph_nodes = -1;
 
     bool recording = false;
 
-    // counters printed at backend free when GGML_D3D12_STATS is set
+    // counters printed at exit when GGML_D3D11_STATS is set
     bool     stats            = false;
     uint64_t n_graphs         = 0;
     uint64_t n_nodes          = 0;
@@ -221,255 +239,197 @@ struct d3d12_device_ctx {
     uint64_t n_get_tensor     = 0;
     uint64_t bytes_set        = 0;
     uint64_t bytes_get        = 0;
-    double   t_wait_us        = 0;   // time inside fence waits
-    double   t_submit_us      = 0;   // time inside Close + ExecuteCommandLists + Signal
-    double   t_compile_us     = 0;   // time inside shader compilation (part of encode)
+    double   t_wait_us        = 0;
+    double   t_submit_us      = 0;
+    double   t_compile_us     = 0;
     uint64_t n_compiles       = 0;
-    bool     no_barrier       = false; // GGML_D3D12_NO_BARRIER: measurement only, results are wrong
-    // GGML_D3D12_DRED: device removed extended data. The breadcrumbs only say how many operations of
-    // the failing list completed, so the names of the dispatches in the list are recorded alongside
-    // them to turn that count into a shader name. Off by default: breadcrumbs cost per dispatch.
-    bool                     dred = false;
-    std::vector<std::string> dispatch_names;
-    bool     no_fuse          = false; // GGML_D3D12_NO_FUSE: encode every node on its own, for bisecting
-    uint32_t mm_tpr_max       = D3D12_WG_SIZE; // GGML_D3D12_MM_TPR: cap on matvec threads per row (1 = no reduction tree)
-    uint32_t tiled_min_cols   = GGML_D3D12_TILED_DEFAULT; // GGML_D3D12_TILED: columns from which the tiled kernels are used (0 = never)
-    com_ptr<ID3D12Resource> mmid_scratch;          // expert lists for the tiled mul_mat_id, see mul_mat_id_prep.hlsl
-    size_t                  mmid_scratch_size = 0;
-    std::string disable_ops;           // GGML_D3D12_DISABLE_OPS: comma separated op names sent to the CPU
+    bool     no_fuse          = false;
+    uint32_t mm_tpr_max       = D3D11_WG_SIZE;
+    uint32_t tiled_min_cols   = GGML_D3D11_TILED_DEFAULT;
+    com_ptr<d3d11_res> mmid_scratch;
+    size_t             mmid_scratch_size = 0;
+    std::string disable_ops;
     std::mutex  rejected_mutex;
-    std::map<std::string, uint64_t> rejected;   // with stats: "op src types -> type" refused by supports_op
-    uint64_t n_flush_arena    = 0;   // mid-graph submits because the param arena was full
-    uint64_t n_flush_batch    = 0;   // mid-graph submits because submit_batch was reached
-    double   t_graph_us       = 0;   // time inside graph_compute
+    std::map<std::string, uint64_t> rejected;
+    uint64_t n_flush_arena    = 0;
+    uint64_t n_flush_batch    = 0;
+    double   t_graph_us       = 0;
     double   t_set_us         = 0;
     double   t_get_us         = 0;
 
-    // GPU timestamp profiling per dispatch when GGML_D3D12_PROFILE is set
-    bool                        profile = false;
-    com_ptr<ID3D12QueryHeap>    query_heap;
-    com_ptr<ID3D12Resource>     query_readback;
-    uint64_t                    timestamp_freq = 0;
-    uint32_t                    query_count    = 0;   // dispatches with queries in the open list
-    std::vector<std::string>    query_names;
-    std::map<std::string, std::pair<double, uint64_t>> prof;   // name -> (gpu us, count)
+    bool                                               profile = false;   // not implemented for D3D11
+    std::map<std::string, std::pair<double, uint64_t>> prof;
 
     std::recursive_mutex mutex;
 
     ggml_backend_buffer_type buft = {};
-
-    ~d3d12_device_ctx() {
-        if (fence_event) {
-            CloseHandle(fence_event);
-        }
-    }
 };
 
-struct ggml_backend_d3d12_buffer_context {
-    std::shared_ptr<d3d12_device_ctx> dev;
-    com_ptr<ID3D12Resource>           res;
-    D3D12_GPU_VIRTUAL_ADDRESS         va = 0;
+void d3d11_res::Release() {
+    if (--refs > 0) {
+        return;
+    }
+    if (dev) {
+        std::lock_guard<std::recursive_mutex> lock(dev->mutex);
+        dev->res_map.erase(va);
+        dev->uavs.erase(dev->uavs.lower_bound({ va, 0 }), dev->uavs.lower_bound({ va + size, 0 }));
+    }
+    delete this;
+}
+
+struct ggml_backend_d3d11_buffer_context {
+    std::shared_ptr<d3d11_device_ctx> dev;
+    com_ptr<d3d11_res>                res;
+    D3D11_GPU_VIRTUAL_ADDRESS         va = 0;
     size_t                            size = 0;
 };
 
-struct ggml_backend_d3d12_context {
-    std::shared_ptr<d3d12_device_ctx> dev;
+struct ggml_backend_d3d11_context {
+    std::shared_ptr<d3d11_device_ctx> dev;
     std::string                       name;
 };
 
 // the registry owns the device contexts; buffers and backends hold shared references
-static std::shared_ptr<d3d12_device_ctx> ggml_d3d12_shared_dev(d3d12_device_ctx * dev);
-static void ggml_d3d12_atexit();
+static std::shared_ptr<d3d11_device_ctx> ggml_d3d11_shared_dev(d3d11_device_ctx * dev);
+static void ggml_d3d11_atexit();
 
 /* Device helpers */
 
-static com_ptr<ID3D12Resource> ggml_d3d12_create_buffer(d3d12_device_ctx & dev,
-                                                        size_t             size,
-                                                        D3D12_HEAP_TYPE    heap_type,
-                                                        const wchar_t *    name) {
-    D3D12_HEAP_PROPERTIES heap = {};
-    heap.Type                  = heap_type;
-    heap.CPUPageProperty       = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heap.MemoryPoolPreference  = D3D12_MEMORY_POOL_UNKNOWN;
-    heap.CreationNodeMask      = 1;
-    heap.VisibleNodeMask       = 1;
-
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension           = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Alignment           = 0;
-    desc.Width               = size;
-    desc.Height              = 1;
-    desc.DepthOrArraySize    = 1;
-    desc.MipLevels           = 1;
-    desc.Format              = DXGI_FORMAT_UNKNOWN;
-    desc.SampleDesc.Count    = 1;
-    desc.SampleDesc.Quality  = 0;
-    desc.Layout              = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags               = heap_type == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                                                                    : D3D12_RESOURCE_FLAG_NONE;
-
-    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    if (heap_type == D3D12_HEAP_TYPE_UPLOAD) {
-        state = D3D12_RESOURCE_STATE_GENERIC_READ;
-    } else if (heap_type == D3D12_HEAP_TYPE_READBACK) {
-        state = D3D12_RESOURCE_STATE_COPY_DEST;
-    }
-
-    com_ptr<ID3D12Resource> res;
-    HRESULT hr = dev.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
-                                                     IID_PPV_ARGS(res.put()));
+static com_ptr<d3d11_res> ggml_d3d11_create_buffer(d3d11_device_ctx & dev, size_t size, d3d11_heap_type heap_type,
+                                                   const wchar_t * name) {
+    GGML_UNUSED(heap_type);
+    GGML_UNUSED(name);
+    size = (size + 255) & ~(size_t) 255;
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth         = (UINT) size;
+    desc.Usage             = D3D11_USAGE_DEFAULT;
+    desc.BindFlags         = D3D11_BIND_UNORDERED_ACCESS;
+    desc.MiscFlags         = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    com_ptr<ID3D11Buffer> buf;
+    HRESULT hr = dev.device->CreateBuffer(&desc, nullptr, buf.put());
     if (FAILED(hr)) {
-        GGML_LOG_ERROR("ggml_d3d12: failed to allocate %zu bytes (heap type %d), HRESULT 0x%08lx\n", size,
-                       (int) heap_type, (unsigned long) hr);
+        GGML_LOG_ERROR("ggml_d3d11: failed to allocate %zu bytes, HRESULT 0x%08lx\n", size, (unsigned long) hr);
         return {};
     }
-    if (name) {
-        res->SetName(name);
-    }
+    std::lock_guard<std::recursive_mutex> lock(dev.mutex);
+    com_ptr<d3d11_res> res;
+    res.p       = new d3d11_res();
+    res.p->dev  = &dev;
+    res.p->buf  = buf;
+    res.p->size = size;
+    res.p->va   = dev.next_va;
+    dev.next_va += (size + 0xffffull) & ~0xffffull;
+    dev.res_map[res.p->va] = res.p;
     return res;
 }
 
-// begin recording on the (single) command list; the previous submission has always completed
-static void ggml_d3d12_begin(d3d12_device_ctx & dev, bool compute) {
-    GGML_ASSERT(!dev.recording);
-    ggml_d3d12_check(dev.allocator->Reset(), "ID3D12CommandAllocator::Reset");
-    ggml_d3d12_check(dev.cmd_list->Reset(dev.allocator.get(), nullptr), "ID3D12GraphicsCommandList::Reset");
-    if (compute) {
-        dev.cmd_list->SetComputeRootSignature(dev.root_sig.get());
+static d3d11_res * ggml_d3d11_find_res(d3d11_device_ctx & dev, uint64_t va) {
+    auto it = dev.res_map.upper_bound(va);
+    GGML_ASSERT(it != dev.res_map.begin());
+    --it;
+    GGML_ASSERT(va < it->first + it->second->size);
+    return it->second;
+}
+
+// raw UAV over [start, end) of a buffer, by fake addresses
+static ID3D11UnorderedAccessView * ggml_d3d11_uav(d3d11_device_ctx & dev, uint64_t start, uint64_t end) {
+    auto it = dev.uavs.find({ start, end });
+    if (it != dev.uavs.end()) {
+        return it->second.get();
     }
-    dev.dispatch_names.clear();
+    d3d11_res *    res = ggml_d3d11_find_res(dev, start);
+    const uint64_t off = start - res->va;
+    GGML_ASSERT(off % 4 == 0 && end > start && end <= res->va + res->size);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC d = {};
+    d.Format              = DXGI_FORMAT_R32_TYPELESS;
+    d.ViewDimension       = D3D11_UAV_DIMENSION_BUFFER;
+    d.Buffer.FirstElement = (UINT) (off / 4);
+    d.Buffer.NumElements  = (UINT) ((end - start + 3) / 4);
+    d.Buffer.Flags        = D3D11_BUFFER_UAV_FLAG_RAW;
+    com_ptr<ID3D11UnorderedAccessView> uav;
+    ggml_d3d11_check(dev.device->CreateUnorderedAccessView(res->buf.get(), &d, uav.put()), "CreateUnorderedAccessView");
+    return (dev.uavs[{ start, end }] = uav).get();
+}
+
+static void ggml_d3d11_begin(d3d11_device_ctx & dev, bool compute) {
+    GGML_UNUSED(compute);
+    GGML_ASSERT(!dev.recording);
     dev.recording = true;
 }
 
-// GGML_D3D12_DRED: print what the driver recorded about the removal. The breadcrumbs of the list
-// that did not finish give the number of completed operations; counting the dispatches among them
-// names the one that was in flight. A page fault address means the shader read out of bounds.
-static void ggml_d3d12_report_dred(d3d12_device_ctx & dev) {
-    com_ptr<ID3D12DeviceRemovedExtendedData1> dred;
-    if (FAILED(dev.device->QueryInterface(IID_PPV_ARGS(dred.put())))) {
-        GGML_LOG_ERROR("ggml_d3d12: DRED unavailable on this device\n");
+// GGML_D3D11_DEBUG: print the debug layer messages stored since the last call
+static void ggml_d3d11_print_debug(d3d11_device_ctx & dev) {
+    if (!dev.info) {
         return;
     }
-    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc = {};
-    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&bc))) {
-        for (const D3D12_AUTO_BREADCRUMB_NODE1 * n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
-            const uint32_t done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-            if (done == n->BreadcrumbCount) {
-                continue;   // this list ran to the end, it is not the one that failed
-            }
-            const std::string list_name = n->pCommandListDebugNameW ? ggml_d3d12_wide_to_utf8(n->pCommandListDebugNameW)
-                                                                    : std::string("?");
-            GGML_LOG_ERROR("ggml_d3d12: DRED list '%s': %u of %u operations completed\n", list_name.c_str(),
-                           (unsigned) done, (unsigned) n->BreadcrumbCount);
-            uint32_t ndisp = 0;
-            for (uint32_t i = 0; i < done; i++) {
-                if (n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH) {
-                    ndisp++;
-                }
-            }
-            if (ndisp < dev.dispatch_names.size()) {
-                GGML_LOG_ERROR("ggml_d3d12: DRED failed in dispatch %u: %s\n", (unsigned) ndisp,
-                               dev.dispatch_names[ndisp].c_str());
-                if (ndisp > 0) {
-                    GGML_LOG_ERROR("ggml_d3d12: DRED previous dispatch: %s\n", dev.dispatch_names[ndisp - 1].c_str());
-                }
-            } else {
-                GGML_LOG_ERROR("ggml_d3d12: DRED %u dispatches completed of %zu recorded\n", (unsigned) ndisp,
-                               dev.dispatch_names.size());
-            }
+    const UINT64 n = dev.info->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        dev.info->GetMessage(i, nullptr, &len);
+        std::vector<char> buf(len);
+        auto * msg = (D3D11_MESSAGE *) buf.data();
+        if (SUCCEEDED(dev.info->GetMessage(i, msg, &len))) {
+            GGML_LOG_WARN("ggml_d3d11: debug layer: %.*s\n", (int) msg->DescriptionByteLength, msg->pDescription);
         }
     }
-    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
-    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA != 0) {
-        GGML_LOG_ERROR("ggml_d3d12: DRED page fault at GPU VA 0x%llx\n", (unsigned long long) pf.PageFaultVA);
-        for (const D3D12_DRED_ALLOCATION_NODE * a = pf.pHeadExistingAllocationNode; a; a = a->pNext) {
-            GGML_LOG_ERROR("ggml_d3d12: DRED   live allocation '%s' type %d\n",
-                           a->ObjectNameA ? a->ObjectNameA : "?", (int) a->AllocationType);
-        }
-        for (const D3D12_DRED_ALLOCATION_NODE * a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext) {
-            GGML_LOG_ERROR("ggml_d3d12: DRED   freed allocation '%s' type %d\n",
-                           a->ObjectNameA ? a->ObjectNameA : "?", (int) a->AllocationType);
-        }
-    }
+    dev.info->ClearStoredMessages();
 }
 
-static void ggml_d3d12_submit_and_wait(d3d12_device_ctx & dev) {
+// flush the queued work and wait until the GPU has finished it
+static void ggml_d3d11_submit_and_wait(d3d11_device_ctx & dev) {
     GGML_ASSERT(dev.recording);
-    if (dev.query_count > 0) {
-        dev.cmd_list->ResolveQueryData(dev.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * dev.query_count,
-                                       dev.query_readback.get(), 0);
-    }
-    const double ts = ggml_d3d12_time_us();
-    ggml_d3d12_check(dev.cmd_list->Close(), "ID3D12GraphicsCommandList::Close");
-    ID3D12CommandList * lists[] = { dev.cmd_list.get() };
-    dev.queue->ExecuteCommandLists(1, lists);
-    const uint64_t v = ++dev.fence_value;
-    ggml_d3d12_check(dev.queue->Signal(dev.fence.get(), v), "ID3D12CommandQueue::Signal");
-    const double t0 = ggml_d3d12_time_us();
+    const double ts = ggml_d3d11_time_us();
+    dev.ctx->End(dev.done_query.get());
+    dev.ctx->Flush();
+    const double t0 = ggml_d3d11_time_us();
     dev.t_submit_us += t0 - ts;
-    if (dev.fence->GetCompletedValue() < v) {
-        ggml_d3d12_check(dev.fence->SetEventOnCompletion(v, dev.fence_event), "ID3D12Fence::SetEventOnCompletion");
-        WaitForSingleObject(dev.fence_event, INFINITE);
+    BOOL done = FALSE;
+    while (dev.ctx->GetData(dev.done_query.get(), &done, sizeof(done), 0) == S_FALSE) {
+        SwitchToThread();
     }
-    dev.t_wait_us += ggml_d3d12_time_us() - t0;
+    dev.t_wait_us += ggml_d3d11_time_us() - t0;
     dev.n_submits++;
-    dev.recording           = false;
-    dev.param_next_slot     = 0;
-    dev.dispatches_in_list  = 0;
-
-    if (dev.query_count > 0) {
-        void *      ptr   = nullptr;
-        D3D12_RANGE range = { 0, 2 * dev.query_count * sizeof(uint64_t) };
-        if (SUCCEEDED(dev.query_readback->Map(0, &range, &ptr))) {
-            const uint64_t * ts = (const uint64_t *) ptr;
-            for (uint32_t i = 0; i < dev.query_count; i++) {
-                const double us = (double) (ts[2 * i + 1] - ts[2 * i]) * 1e6 / (double) dev.timestamp_freq;
-                auto & e = dev.prof[dev.query_names[i]];
-                e.first += us;
-                e.second++;
-            }
-            D3D12_RANGE no_write = { 0, 0 };
-            dev.query_readback->Unmap(0, &no_write);
-        }
-        dev.query_count = 0;
-        dev.query_names.clear();
-    }
+    ggml_d3d11_print_debug(dev);
+    dev.recording          = false;
+    dev.dispatches_in_list = 0;
 
     HRESULT removed = dev.device->GetDeviceRemovedReason();
     if (FAILED(removed)) {
-        GGML_LOG_ERROR("ggml_d3d12: device removed, reason 0x%08lx\n", (unsigned long) removed);
-        if (dev.dred) {
-            ggml_d3d12_report_dred(dev);
-        } else {
-            GGML_LOG_ERROR("ggml_d3d12: set GGML_D3D12_DRED=1 to name the dispatch that failed\n");
-        }
-        // abort() does not flush stdio, and stderr is fully buffered when it is a pipe, so without this
-        // everything printed above is lost and only the abort message survives
+        GGML_LOG_ERROR("ggml_d3d11: device removed, reason 0x%08lx\n", (unsigned long) removed);
         fflush(stderr);
-        GGML_ABORT("ggml_d3d12: device removed");
+        GGML_ABORT("ggml_d3d11: device removed");
     }
 }
 
 /* Shader compilation */
 
-static const char * ggml_d3d12_profile(D3D_SHADER_MODEL sm) {
-    switch (sm) {
-        case D3D_SHADER_MODEL_6_0: return "cs_6_0";
-        case D3D_SHADER_MODEL_6_1: return "cs_6_1";
-        case D3D_SHADER_MODEL_6_2: return "cs_6_2";
-        case D3D_SHADER_MODEL_6_3: return "cs_6_3";
-        case D3D_SHADER_MODEL_6_4: return "cs_6_4";
-        case D3D_SHADER_MODEL_6_5: return "cs_6_5";
-        case D3D_SHADER_MODEL_6_6: return "cs_6_6";
-        default:                   return "cs_6_7";
-    }
+// compiled DXBC is cached in d3d11-shader-cache next to ggml-d3d11.dll; GGML_D3D11_NO_SHADER_CACHE disables it.
+// Unwritable folders just skip the cache.
+static const std::wstring & ggml_d3d11_shader_cache_dir() {
+    static const std::wstring dir = []() -> std::wstring {
+        if (getenv("GGML_D3D11_NO_SHADER_CACHE") != nullptr) {
+            return L"";
+        }
+        HMODULE module = nullptr;
+        wchar_t path[MAX_PATH];
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR) &ggml_d3d11_shader_cache_dir, &module) ||
+            GetModuleFileNameW(module, path, MAX_PATH) - 1 >= MAX_PATH - 1) {
+            return L"";
+        }
+        std::wstring d = path;
+        d = d.substr(0, d.find_last_of(L"\\/") + 1) + L"d3d11-shader-cache";
+        CreateDirectoryW(d.c_str(), nullptr);
+        return d;
+    }();
+    return dir;
 }
 
-// compiled DXIL is cached in d3d12-shader-cache next to ggml-d3d12.dll, named by a hash of the source and
-// the compiler arguments; GGML_D3D12_NO_SHADER_CACHE disables it. Unwritable folders just skip the cache.
-static std::wstring ggml_d3d12_shader_cache_file(const char * source, const std::vector<std::wstring> & args) {
-    static const bool disabled = getenv("GGML_D3D12_NO_SHADER_CACHE") != nullptr;
-    if (disabled) {
+// the file name is a hash of the source, the defines and the FXC flags, so a change recompiles only
+// the shaders it touches. Do not add a global salt: a full recompile is slow on weak CPUs.
+static std::wstring ggml_d3d11_shader_cache_file(const char * source, const std::vector<std::string> & args, UINT flags) {
+    const std::wstring & dir = ggml_d3d11_shader_cache_dir();
+    if (dir.empty()) {
         return L"";
     }
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -479,28 +439,22 @@ static std::wstring ggml_d3d12_shader_cache_file(const char * source, const std:
             h = (h ^ b[i]) * 0x100000001b3ULL;
         }
     };
+    hash_bytes("fxc-4", 5);
+    if (flags != D3DCOMPILE_OPTIMIZATION_LEVEL3) {   // default flags are not hashed: keeps older cache files valid
+        hash_bytes(&flags, sizeof(flags));
+    }
     hash_bytes(source, strlen(source));
     for (const auto & a : args) {
-        hash_bytes(a.c_str(), (a.size() + 1) * sizeof(wchar_t));
+        hash_bytes(a.c_str(), a.size() + 1);
     }
-    HMODULE module = nullptr;
-    wchar_t path[MAX_PATH];
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCWSTR) &ggml_d3d12_shader_cache_file, &module) ||
-        GetModuleFileNameW(module, path, MAX_PATH) - 1 >= MAX_PATH - 1) {   // 0 = error, MAX_PATH = truncated
-        return L"";
-    }
-    std::wstring dir = path;
-    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"d3d12-shader-cache";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    std::wstring name = L"\\0000000000000000.dxil";
+    std::wstring name = L"\\0000000000000000.dxbc";
     for (int i = 16; i > 0; i--, h >>= 4) {
         name[i] = L"0123456789abcdef"[h & 0xf];
     }
     return dir + name;
 }
 
-static std::vector<uint8_t> ggml_d3d12_read_file(const std::wstring & file) {
+static std::vector<uint8_t> ggml_d3d11_read_file(const std::wstring & file) {
     std::vector<uint8_t> data;
     FILE * f = file.empty() ? nullptr : _wfopen(file.c_str(), L"rb");
     if (f) {
@@ -515,7 +469,6 @@ static std::vector<uint8_t> ggml_d3d12_read_file(const std::wstring & file) {
         }
         fclose(f);
     }
-    // a DXIL container starts with DXBC
     if (data.size() < 32 || memcmp(data.data(), "DXBC", 4) != 0) {
         data.clear();
     }
@@ -523,7 +476,7 @@ static std::vector<uint8_t> ggml_d3d12_read_file(const std::wstring & file) {
 }
 
 // write to a per-process temp name and rename, so concurrent processes never see a partial file
-static void ggml_d3d12_write_file(const std::wstring & file, const void * data, size_t size) {
+static void ggml_d3d11_write_file(const std::wstring & file, const void * data, size_t size) {
     if (file.empty()) {
         return;
     }
@@ -539,102 +492,209 @@ static void ggml_d3d12_write_file(const std::wstring & file, const void * data, 
     }
 }
 
-// builds one pipeline from the disk cache or by compiling; thread safe when each thread passes its own compiler
-static d3d12_pipeline ggml_d3d12_build_pipeline(d3d12_device_ctx &               dev,
-                                               IDxcCompiler3 *                  compiler,
-                                               const std::string &              key,
-                                               const char *                     source,
-                                               const std::vector<std::string> & defines,
-                                               D3D_SHADER_MODEL                 min_sm) {
-    const double t_compile0 = ggml_d3d12_time_us();
-
-    const bool use_16bit = std::find(defines.begin(), defines.end(), "USE_16BIT") != defines.end();
-    D3D_SHADER_MODEL sm  = std::max(min_sm, use_16bit ? D3D_SHADER_MODEL_6_2 : D3D_SHADER_MODEL_6_0);
-    GGML_ASSERT(sm <= dev.caps.shader_model);
-
-    std::vector<std::wstring> args = { L"-E", L"main", L"-T", ggml_d3d12_utf8_to_wide(ggml_d3d12_profile(sm)),
-                                       L"-O3", L"-DWG_SIZE=" + std::to_wstring(D3D12_WG_SIZE) };
-    if (use_16bit) {
-        args.push_back(L"-enable-16bit-types");
-    }
-#ifdef GGML_D3D12_DEBUG
-    args.push_back(L"-Zi");
-    args.push_back(L"-Qembed_debug");
-#endif
-    for (const auto & d : defines) {
-        args.push_back(L"-D" + ggml_d3d12_utf8_to_wide(d));
-    }
-    std::vector<LPCWSTR> argv;
-    for (const auto & a : args) {
-        argv.push_back(a.c_str());
-    }
-
-    const std::wstring   cache_file = ggml_d3d12_shader_cache_file(source, args);
-    for (int attempt = 0;; attempt++) {
-        std::vector<uint8_t> dxil   = attempt == 0 ? ggml_d3d12_read_file(cache_file) : std::vector<uint8_t>();
-        const bool           cached = !dxil.empty();
-        if (!cached) {
-            DxcBuffer src = {};
-            src.Ptr       = source;
-            src.Size      = strlen(source);
-            src.Encoding  = DXC_CP_UTF8;
-
-            com_ptr<IDxcResult> result;
-            ggml_d3d12_check(compiler->Compile(&src, argv.data(), (UINT32) argv.size(), nullptr, IID_PPV_ARGS(result.put())),
-                             "IDxcCompiler3::Compile");
-
-            com_ptr<IDxcBlobUtf8> errors;
-            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(errors.put()), nullptr);
-            HRESULT status = S_OK;
-            result->GetStatus(&status);
-            if (FAILED(status)) {
-                GGML_LOG_ERROR("ggml_d3d12: shader compilation failed for %s:\n%s\n", key.c_str(),
-                               errors && errors->GetStringLength() ? errors->GetStringPointer() : "(no output)");
-                GGML_ABORT("ggml_d3d12: shader compilation failed");
-            }
-#ifdef GGML_D3D12_DEBUG
-            if (errors && errors->GetStringLength()) {
-                GGML_LOG_WARN("ggml_d3d12: shader %s warnings:\n%s\n", key.c_str(), errors->GetStringPointer());
-            }
-#endif
-
-            com_ptr<IDxcBlob> object;
-            ggml_d3d12_check(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(object.put()), nullptr), "IDxcResult::GetOutput");
-            const uint8_t * bytes = (const uint8_t *) object->GetBufferPointer();
-            dxil.assign(bytes, bytes + object->GetBufferSize());
-            ggml_d3d12_write_file(cache_file, dxil.data(), dxil.size());
+// FXC at level 3 gives wrong values for these types (GET_ROWS on R9700 and Iris Xe; right with the
+// optimizer off). iq1_s does not fit in the register limit without the optimizer, so it gets level 1.
+static UINT ggml_d3d11_compile_flags(const std::string & key) {
+    UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    for (const char * t : { "Q3_K", "IQ2_S", "IQ3_S" }) {
+        if (key.find(std::string("SRC0_") + t) != std::string::npos) {
+            flags = D3DCOMPILE_SKIP_OPTIMIZATION;
         }
+    }
+    if (key.find("SRC0_IQ1_S") != std::string::npos) {
+        flags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    }
+    return flags;
+}
 
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
-        pso_desc.pRootSignature                    = dev.root_sig.get();
-        pso_desc.CS.pShaderBytecode                = dxil.data();
-        pso_desc.CS.BytecodeLength                 = dxil.size();
+// each used shader adds a line "source<TAB>key<TAB>define..." to this file; the next process
+// compiles the listed shaders that are not in the cache on all CPU cores (see ggml_d3d11_prewarm)
+static std::wstring ggml_d3d11_shader_list_file() {
+    const std::wstring & dir = ggml_d3d11_shader_cache_dir();
+    return dir.empty() ? L"" : dir + L"\\shaders.txt";
+}
 
-        d3d12_pipeline pipeline;
-        pipeline.name = key;
-        HRESULT hr    = dev.device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(pipeline.pso.put()));
-        if (FAILED(hr) && cached) {
-            // a stale or damaged cache entry: drop it and compile from source
-            GGML_LOG_WARN("ggml_d3d12: cached shader rejected for %s, recompiling\n", key.c_str());
-            DeleteFileW(cache_file.c_str());
+// returns the DXBC from the disk cache, or compiles it with FXC and caches it; thread safe
+static std::vector<uint8_t> ggml_d3d11_get_dxbc(const std::string &              key,
+                                                const char *                     source,
+                                                const std::vector<std::string> & defines,
+                                                std::wstring &                   cache_file) {
+    // USE_16BIT selects SM 6.2 16-bit loads; without it common.hlsli emulates them with 32-bit words
+    std::vector<std::string> args = { "WG_SIZE=" + std::to_string(D3D11_WG_SIZE), "GGML_D3D11" };
+    for (const auto & d : defines) {
+        if (d != "USE_16BIT") {
+            args.push_back(d);
+        }
+    }
+    const UINT flags = ggml_d3d11_compile_flags(key);
+    cache_file       = ggml_d3d11_shader_cache_file(source, args, flags);
+    std::vector<uint8_t> dxbc = ggml_d3d11_read_file(cache_file);
+    if (!dxbc.empty()) {
+        return dxbc;
+    }
+    std::vector<std::string> names, values;
+    for (const auto & a : args) {
+        const size_t eq = a.find('=');
+        names.push_back(a.substr(0, eq));
+        values.push_back(eq == std::string::npos ? "1" : a.substr(eq + 1));
+    }
+    std::vector<D3D_SHADER_MACRO> macros;
+    for (size_t i = 0; i < args.size(); i++) {
+        macros.push_back({ names[i].c_str(), values[i].c_str() });
+    }
+    macros.push_back({ nullptr, nullptr });
+
+    com_ptr<ID3DBlob> code, errors;
+    HRESULT hr = D3DCompile(source, strlen(source), key.c_str(), macros.data(), nullptr, "main", "cs_5_0",
+                            flags, 0, code.put(), errors.put());
+    if (FAILED(hr)) {
+        GGML_LOG_ERROR("ggml_d3d11: shader compilation failed for %s:\n%s\n", key.c_str(),
+                       errors ? (const char *) errors->GetBufferPointer() : "(no output)");
+        fflush(stderr);
+        GGML_ABORT("ggml_d3d11: shader compilation failed");
+    }
+    if (errors && errors->GetBufferSize() > 1) {
+        GGML_LOG_WARN("ggml_d3d11: FXC warnings for %s:\n%s\n", key.c_str(), (const char *) errors->GetBufferPointer());
+    }
+    const uint8_t * bytes = (const uint8_t *) code->GetBufferPointer();
+    dxbc.assign(bytes, bytes + code->GetBufferSize());
+    ggml_d3d11_write_file(cache_file, dxbc.data(), dxbc.size());
+    return dxbc;
+}
+
+// keys already in the list file, read by ggml_d3d11_prewarm
+static std::mutex                   g_listed_mutex;
+static std::map<std::string, bool>  g_listed;
+
+// adds a shader to the list file once; one short append per line, so parallel processes do not mix lines
+static void ggml_d3d11_list_shader(const std::string & key, const char * source, const std::vector<std::string> & defines) {
+    const std::wstring file = ggml_d3d11_shader_list_file();
+    {
+        std::lock_guard<std::mutex> lock(g_listed_mutex);
+        if (g_listed[key]) {
+            return;
+        }
+        g_listed[key] = true;
+    }
+    for (const auto & t : hlsl_table) {
+        if (t.source != source || file.empty()) {
             continue;
         }
-        if (FAILED(hr)) {
-            GGML_LOG_ERROR("ggml_d3d12: CreateComputePipelineState failed for %s (HRESULT 0x%08lx). "
-                           "If dxil.dll is missing next to dxcompiler.dll the shader is unsigned and rejected.\n",
-                           key.c_str(), (unsigned long) hr);
-            GGML_ABORT("ggml_d3d12: pipeline creation failed");
+        std::string line = std::string(t.name) + "\t" + key;
+        for (const auto & d : defines) {
+            line += "\t" + d;
         }
-        D3D12_LOG_DEBUG("compiled pipeline %s\n", key.c_str());
-        std::lock_guard<std::mutex> lock(dev.pipelines_mutex);
-        dev.n_compiles++;
-        dev.t_compile_us += ggml_d3d12_time_us() - t_compile0;
-        return pipeline;
+        line += "\n";
+        std::lock_guard<std::mutex> lock(g_listed_mutex);
+        if (FILE * f = _wfopen(file.c_str(), L"ab")) {
+            fwrite(line.data(), 1, line.size(), f);
+            fclose(f);
+        }
+        return;
     }
 }
 
+// compiles the listed shaders that are missing from the cache, on all CPU cores, in the background.
+// test-backend-ops makes one small graph per case and needs about one new shader each time, so without
+// this all compilation runs on one core.
+static void ggml_d3d11_prewarm() {
+    struct item {
+        std::string              key;
+        const char *             source;
+        std::vector<std::string> defines;
+    };
+    std::vector<item> items;
+    std::lock_guard<std::mutex> lock(g_listed_mutex);
+    std::map<std::string, bool> & seen = g_listed;
+    FILE * f = nullptr;
+    const std::wstring file = ggml_d3d11_shader_list_file();
+    if (file.empty() || (f = _wfopen(file.c_str(), L"rb")) == nullptr) {
+        return;
+    }
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), f)) {
+        std::vector<std::string> fields;
+        std::string              line = buf;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.pop_back();
+        }
+        for (size_t pos = 0; pos <= line.size();) {
+            const size_t tab = std::min(line.find('\t', pos), line.size());
+            fields.push_back(line.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        if (fields.size() < 2 || seen[fields[1]]) {
+            continue;
+        }
+        seen[fields[1]] = true;
+        for (const auto & t : hlsl_table) {
+            if (fields[0] == t.name) {
+                items.push_back({ fields[1], t.source, std::vector<std::string>(fields.begin() + 2, fields.end()) });
+            }
+        }
+    }
+    fclose(f);
+
+    // drop the ones already in the cache
+    std::vector<item> missing;
+    for (auto & it : items) {
+        std::vector<std::string> args = { "WG_SIZE=" + std::to_string(D3D11_WG_SIZE), "GGML_D3D11" };
+        for (const auto & d : it.defines) {
+            if (d != "USE_16BIT") {
+                args.push_back(d);
+            }
+        }
+        const std::wstring cf = ggml_d3d11_shader_cache_file(it.source, args, ggml_d3d11_compile_flags(it.key));
+        if (GetFileAttributesW(cf.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            missing.push_back(std::move(it));
+        }
+    }
+    if (missing.empty()) {
+        return;
+    }
+    const size_t n_threads = std::min<size_t>(missing.size(), std::max(1u, std::thread::hardware_concurrency()));
+    GGML_LOG_INFO("ggml_d3d11: compiling %zu listed shaders on %zu threads in the background\n", missing.size(), n_threads);
+    auto shared = std::make_shared<std::vector<item>>(std::move(missing));
+    auto next   = std::make_shared<std::atomic<size_t>>(0);
+    for (size_t t = 0; t < n_threads; t++) {
+        std::thread([shared, next]() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            for (size_t i; (i = (*next)++) < shared->size();) {
+                const item & it = (*shared)[i];
+                std::wstring cf;
+                ggml_d3d11_get_dxbc(it.key, it.source, it.defines, cf);
+            }
+        }).detach();
+    }
+}
+
+// builds one pipeline from the disk cache or by compiling with FXC; thread safe
+static d3d11_pipeline ggml_d3d11_build_pipeline(d3d11_device_ctx &               dev,
+                                               const std::string &              key,
+                                               const char *                     source,
+                                               const std::vector<std::string> & defines) {
+    const double t_compile0 = ggml_d3d11_time_us();
+
+    std::wstring               cache_file;
+    const std::vector<uint8_t> dxbc = ggml_d3d11_get_dxbc(key, source, defines, cache_file);
+    ggml_d3d11_list_shader(key, source, defines);
+    d3d11_pipeline pipeline;
+    pipeline.name = key;
+    HRESULT hr = dev.device->CreateComputeShader(dxbc.data(), dxbc.size(), nullptr, pipeline.cs.put());
+    if (FAILED(hr)) {
+        GGML_LOG_ERROR("ggml_d3d11: CreateComputeShader failed for %s (HRESULT 0x%08lx)\n", key.c_str(), (unsigned long) hr);
+        DeleteFileW(cache_file.c_str());
+        fflush(stderr);
+        GGML_ABORT("ggml_d3d11: pipeline creation failed");
+    }
+    std::lock_guard<std::mutex> lock(dev.pipelines_mutex);
+    dev.n_compiles++;
+    dev.t_compile_us += ggml_d3d11_time_us() - t_compile0;
+    return pipeline;
+}
+
 // defines: list of "NAME" or "NAME=VALUE"
-static d3d12_pipeline & ggml_d3d12_get_pipeline(d3d12_device_ctx &               dev,
+static d3d11_pipeline & ggml_d3d11_get_pipeline(d3d11_device_ctx &               dev,
                                                 const char *                     shader_name,
                                                 const char *                     source,
                                                 const std::vector<std::string> & defines,
@@ -643,44 +703,36 @@ static d3d12_pipeline & ggml_d3d12_get_pipeline(d3d12_device_ctx &              
     for (const auto & d : defines) {
         key += " -D" + d;
     }
-    if (min_sm > D3D_SHADER_MODEL_6_0) {
-        key += " sm" + std::to_string((int) min_sm);
-    }
-
     auto it = dev.pipelines.find(key);
     if (it != dev.pipelines.end()) {
         return it->second;
     }
     if (dev.collecting) {
-        // collect pass: queue the pipeline once; the pass records no dispatches, so a placeholder is enough
-        static d3d12_pipeline placeholder;
+        static d3d11_pipeline placeholder;
         const bool queued = std::any_of(dev.pipeline_jobs.begin(), dev.pipeline_jobs.end(),
-                                        [&](const d3d12_device_ctx::pipeline_job & j) { return j.key == key; });
+                                        [&](const d3d11_device_ctx::pipeline_job & j) { return j.key == key; });
         if (!queued) {
             dev.pipeline_jobs.push_back({ key, source, defines, min_sm });
         }
         return placeholder;
     }
-    d3d12_pipeline pipeline = ggml_d3d12_build_pipeline(dev, dev.compiler.get(), key, source, defines, min_sm);
+    d3d11_pipeline pipeline = ggml_d3d11_build_pipeline(dev, key, source, defines);
     return dev.pipelines.emplace(key, std::move(pipeline)).first->second;
 }
 
-// builds the queued pipelines on worker threads, each with its own compiler instance
-static void ggml_d3d12_build_pipeline_jobs(d3d12_device_ctx & dev) {
-    std::vector<d3d12_device_ctx::pipeline_job> jobs;
+// builds the queued pipelines on worker threads (FXC and CreateComputeShader are thread safe)
+static void ggml_d3d11_build_pipeline_jobs(d3d11_device_ctx & dev) {
+    std::vector<d3d11_device_ctx::pipeline_job> jobs;
     jobs.swap(dev.pipeline_jobs);
     if (jobs.empty()) {
         return;
     }
-    auto           create    = (DxcCreateInstanceProc) (void *) GetProcAddress(dev.dxc_module, "DxcCreateInstance");
-    const size_t   n_threads = std::min<size_t>(jobs.size(), std::max(1u, std::thread::hardware_concurrency()));
+    const size_t        n_threads = std::min<size_t>(jobs.size(), std::max(1u, std::thread::hardware_concurrency()));
     std::atomic<size_t> next{ 0 };
     auto worker = [&]() {
-        com_ptr<IDxcCompiler3> compiler;
-        ggml_d3d12_check(create(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.put())), "DxcCreateInstance");
         for (size_t i; (i = next++) < jobs.size();) {
             const auto &   j = jobs[i];
-            d3d12_pipeline p = ggml_d3d12_build_pipeline(dev, compiler.get(), j.key, j.source, j.defines, j.min_sm);
+            d3d11_pipeline p = ggml_d3d11_build_pipeline(dev, j.key, j.source, j.defines);
             std::lock_guard<std::mutex> lock(dev.pipelines_mutex);
             dev.pipelines.emplace(j.key, std::move(p));
         }
@@ -697,162 +749,205 @@ static void ggml_d3d12_build_pipeline_jobs(d3d12_device_ctx & dev) {
 
 /* Dispatch encoding */
 
-static inline void ggml_d3d12_workgroups_2d(uint32_t total_wg, uint32_t & wg_x, uint32_t & wg_y) {
-    wg_y = std::max(1u, CEIL_DIV(total_wg, (uint32_t) D3D12_MAX_WG_PER_DIM));
+static inline void ggml_d3d11_workgroups_2d(uint32_t total_wg, uint32_t & wg_x, uint32_t & wg_y) {
+    wg_y = std::max(1u, CEIL_DIV(total_wg, (uint32_t) D3D11_MAX_WG_PER_DIM));
     wg_x = CEIL_DIV(total_wg, wg_y);
 }
 
-static inline uint32_t ggml_d3d12_u32_from_f32(float value) {
+static inline uint32_t ggml_d3d11_u32_from_f32(float value) {
     uint32_t u;
     memcpy(&u, &value, sizeof(u));
     return u;
 }
 
-struct d3d12_binding {
-    D3D12_GPU_VIRTUAL_ADDRESS va;
+struct d3d11_binding {
+    D3D11_GPU_VIRTUAL_ADDRESS va;
     uint32_t                  elem_offset;   // misalignment in elements, passed to the kernel
 };
 
-static D3D12_GPU_VIRTUAL_ADDRESS ggml_d3d12_tensor_va(const ggml_tensor * t) {
-    auto * buf_ctx = (ggml_backend_d3d12_buffer_context *) t->buffer->context;
+static D3D11_GPU_VIRTUAL_ADDRESS ggml_d3d11_tensor_va(const ggml_tensor * t) {
+    auto * buf_ctx = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
     return buf_ctx->va;
 }
 
 // Bind at the largest 256-byte aligned offset at or before the tensor such that the distance is a
 // whole number of type blocks, so the kernel can index the remainder in elements.
-static d3d12_binding ggml_d3d12_bind_tensor(const ggml_tensor * t) {
-    const size_t offset    = ggml_d3d12_tensor_offset(t);
+static d3d11_binding ggml_d3d11_bind_tensor(const ggml_tensor * t) {
+    const size_t offset    = ggml_d3d11_tensor_offset(t);
     const size_t type_size = ggml_type_size(t->type);
-    size_t       aligned   = offset & ~((size_t) D3D12_BINDING_ALIGNMENT - 1);
+    size_t       aligned   = offset & ~((size_t) D3D11_BINDING_ALIGNMENT - 1);
     while ((offset - aligned) % type_size != 0) {
-        GGML_ASSERT(aligned >= D3D12_BINDING_ALIGNMENT);
-        aligned -= D3D12_BINDING_ALIGNMENT;
+        GGML_ASSERT(aligned >= D3D11_BINDING_ALIGNMENT);
+        aligned -= D3D11_BINDING_ALIGNMENT;
     }
-    d3d12_binding b;
-    b.va          = ggml_d3d12_tensor_va(t) + aligned;
+    d3d11_binding b;
+    b.va          = ggml_d3d11_tensor_va(t) + aligned;
     b.elem_offset = (uint32_t) ((offset - aligned) / type_size);
+    // D3D11 refuses overlapping UAVs of one buffer, so each view covers only its tensor
+    auto *         buf_ctx = (ggml_backend_d3d11_buffer_context *) t->buffer->context;
+    const uint64_t end     = std::min<uint64_t>(ggml_d3d11_tensor_va(t) + ((offset + ggml_nbytes(t) + 3) & ~(size_t) 3),
+                                                buf_ctx->va + buf_ctx->size);
+    uint64_t &     e       = buf_ctx->dev->bind_end[b.va];
+    e = std::max(e, end);
+    // a written tensor (a node output) is tagged in the address, so the dispatch knows the written slot
+    // even when a read slot has the same address (an in-place op)
+    for (const ggml_tensor * o : buf_ctx->dev->out_nodes) {
+        if (o != nullptr && o == t) {
+            b.va |= D3D11_VA_WRITTEN;
+        }
+    }
     return b;
 }
 
-// records one dispatch on the open compute command list (params get nwg_x appended)
-static void ggml_d3d12_dispatch(d3d12_device_ctx &                       dev,
-                                d3d12_pipeline &                         pipeline,
-                                std::vector<uint32_t>                    params,
-                                const std::vector<D3D12_GPU_VIRTUAL_ADDRESS> & uavs,
-                                uint32_t                                 total_wg) {
+// records one dispatch on the immediate context (params get nwg_x appended)
+static void ggml_d3d11_dispatch(d3d11_device_ctx &                             dev,
+                                d3d11_pipeline &                               pipeline,
+                                std::vector<uint32_t>                          params,
+                                const std::vector<D3D11_GPU_VIRTUAL_ADDRESS> & uavs,
+                                uint32_t                                       total_wg) {
     GGML_ASSERT(dev.recording);
-    GGML_ASSERT(uavs.size() <= D3D12_MAX_ROOT_UAVS);
+    GGML_ASSERT(uavs.size() <= dev.max_uavs && uavs.size() <= D3D11_MAX_ROOT_UAVS);
     if (dev.collecting) {
+        dev.bind_end.clear();
         return;
     }
 
     uint32_t wg_x, wg_y;
-    ggml_d3d12_workgroups_2d(total_wg, wg_x, wg_y);
+    ggml_d3d11_workgroups_2d(total_wg, wg_x, wg_y);
     params.push_back(wg_x);
-    GGML_ASSERT(params.size() * sizeof(uint32_t) <= D3D12_PARAM_SLOT_SIZE);
+    GGML_ASSERT(params.size() * sizeof(uint32_t) <= D3D11_PARAM_SLOT_SIZE);
 
-    if (dev.param_next_slot >= D3D12_PARAM_SLOT_COUNT || dev.dispatches_in_list >= dev.submit_batch) {
-        // arena exhausted or batch full: flush what we have and start a new list
-        if (dev.param_next_slot >= D3D12_PARAM_SLOT_COUNT) { dev.n_flush_arena++; } else { dev.n_flush_batch++; }
-        ggml_d3d12_submit_and_wait(dev);
-        ggml_d3d12_begin(dev, true);
+    if (dev.dispatches_in_list >= dev.submit_batch) {
+        // keep the GPU busy on long graphs
+        dev.ctx->Flush();
+        dev.n_flush_batch++;
+        dev.dispatches_in_list = 0;
     }
     dev.dispatches_in_list++;
-    const uint32_t slot = dev.param_next_slot++;
-    memcpy(dev.param_ptr + (size_t) slot * D3D12_PARAM_SLOT_SIZE, params.data(), params.size() * sizeof(uint32_t));
 
-    dev.cmd_list->SetPipelineState(pipeline.pso.get());
-    dev.cmd_list->SetComputeRootConstantBufferView(0, dev.param_va + (uint64_t) slot * D3D12_PARAM_SLOT_SIZE);
-    for (size_t i = 0; i < uavs.size(); i++) {
-        dev.cmd_list->SetComputeRootUnorderedAccessView((UINT) (1 + i), uavs[i]);
-    }
-    const bool timed = dev.profile && dev.query_count < D3D12_QUERY_CAPACITY / 2;
-    if (timed) {
-        dev.cmd_list->EndQuery(dev.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * dev.query_count);
-    }
-    if (dev.dred) {
-        // the shader name alone does not say which tensor failed, so keep the root constants too
-        std::string rec = pipeline.name + " wg=" + std::to_string(total_wg) + " params=";
-        for (size_t i = 0; i < params.size(); i++) {
-            rec += (i ? "," : "") + std::to_string(params[i]);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    ggml_d3d11_check(dev.ctx->Map(dev.cbuf.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m), "Map (params)");
+    memcpy(m.pData, params.data(), params.size() * sizeof(uint32_t));
+    dev.ctx->Unmap(dev.cbuf.get(), 0);
+
+    // ranges: a bound tensor ends where its data ends, other buffers (scratch) at the buffer end
+    const size_t n = uavs.size();
+    uint64_t     lo[D3D11_MAX_ROOT_UAVS], hi[D3D11_MAX_ROOT_UAVS];
+    bool         out[D3D11_MAX_ROOT_UAVS] = {};
+    d3d11_res *  rs[D3D11_MAX_ROOT_UAVS];
+    // address 0: an unused slot (a D3D12 placeholder), bound as a null UAV
+    for (size_t i = 0; i < n; i++) {
+        if (uavs[i] == 0) {
+            rs[i] = nullptr;
+            lo[i] = hi[i] = 0;
+            continue;
         }
-        // and the bound addresses, to place a DRED page fault address inside or past one of them
-        rec += " uav=";
-        for (size_t i = 0; i < uavs.size(); i++) {
-            char va[24];
-            snprintf(va, sizeof(va), "%s0x%llx", i ? "," : "", (unsigned long long) uavs[i]);
-            rec += va;
-        }
-        dev.dispatch_names.push_back(rec);
+        const uint64_t va = uavs[i] & ~D3D11_VA_WRITTEN;
+        out[i]  = (uavs[i] & D3D11_VA_WRITTEN) != 0;
+        rs[i]   = ggml_d3d11_find_res(dev, va);
+        lo[i]   = va;
+        auto it = dev.bind_end.find(va);
+        hi[i]   = it != dev.bind_end.end() ? it->second : rs[i]->va + rs[i]->size;
     }
-    dev.cmd_list->Dispatch(wg_x, wg_y, 1);
+    dev.bind_end.clear();
+    // D3D11 refuses two UAVs of one buffer in one dispatch, even when their ranges do not overlap.
+    // Of the slots that share a buffer, one keeps it: the written one (a node output), else the last.
+    // The others use copies; a written copy is copied back after the dispatch.
+    uint64_t back_lo[D3D11_MAX_ROOT_UAVS] = {};
+    for (size_t i = 0; i < n; i++) {
+        if (!rs[i]) {
+            continue;
+        }
+        size_t keep = i;
+        for (size_t j = 0; j < n; j++) {
+            if (rs[j] == rs[i] && (out[j] ? (!out[keep] || j > keep) : (!out[keep] && j > keep))) {
+                keep = j;
+            }
+        }
+        if (keep == i) {
+            continue;
+        }
+        // one copy buffer per slot: two slots in one copy buffer would conflict again
+        const uint64_t size = hi[i] - lo[i];
+        com_ptr<d3d11_res> & cp = dev.alias_copy[i];
+        if (!cp || cp->size < size) {
+            cp = ggml_d3d11_create_buffer(dev, std::max<size_t>(size, 1 << 20), D3D11_HEAP_TYPE_DEFAULT, nullptr);
+            GGML_ASSERT(cp);
+        }
+        D3D11_BOX box = { (UINT) (lo[i] - rs[i]->va), 0, 0, (UINT) (hi[i] - rs[i]->va), 1, 1 };
+        dev.ctx->CopySubresourceRegion(cp->buf.get(), 0, 0, 0, 0, rs[i]->buf.get(), 0, &box);
+        back_lo[i] = out[i] ? lo[i] : 0;
+        lo[i] = cp->va;
+        hi[i] = cp->va + size;
+    }
+    ID3D11UnorderedAccessView * views[D3D11_MAX_ROOT_UAVS] = {};
+    for (size_t i = 0; i < n; i++) {
+        views[i] = rs[i] ? ggml_d3d11_uav(dev, lo[i], hi[i]) : nullptr;
+    }
+    ID3D11Buffer * cb = dev.cbuf.get();
+    dev.ctx->CSSetShader(pipeline.cs.get(), nullptr, 0);
+    dev.ctx->CSSetConstantBuffers(0, 1, &cb);
+    dev.ctx->CSSetUnorderedAccessViews(0, std::min<UINT>(dev.max_uavs, D3D11_MAX_ROOT_UAVS), views, nullptr);
+    dev.ctx->Dispatch(wg_x, wg_y, 1);
     dev.n_dispatches++;
-
-    // TODO: only barrier between dependent nodes
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    barrier.UAV.pResource          = nullptr;
-    if (!dev.no_barrier) {
-        dev.cmd_list->ResourceBarrier(1, &barrier);
-    }
-
-    // the end stamp goes after the barrier: before it, the stamp only measured dispatch issue
-    if (timed) {
-        dev.cmd_list->EndQuery(dev.query_heap.get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * dev.query_count + 1);
-        dev.query_names.push_back(pipeline.name);
-        dev.query_count++;
+    for (size_t i = 0; i < n; i++) {
+        if (back_lo[i] != 0) {
+            // tensors start on D3D11_BINDING_ALIGNMENT, so [lo, hi) holds no bytes of other tensors
+            const D3D11_BOX box = { 0, 0, 0, (UINT) (hi[i] - lo[i]), 1, 1 };
+            dev.ctx->CopySubresourceRegion(rs[i]->buf.get(), 0, (UINT) (back_lo[i] - rs[i]->va), 0, 0,
+                                           dev.alias_copy[i]->buf.get(), 0, &box);
+        }
     }
 }
 
 // memset [offset, offset+size) bytes of a buffer with a replicated byte value; standalone submission
-static void ggml_d3d12_buffer_memset(d3d12_device_ctx & dev, D3D12_GPU_VIRTUAL_ADDRESS va, size_t offset, size_t size, uint8_t value) {
+static void ggml_d3d11_buffer_memset(d3d11_device_ctx & dev, D3D11_GPU_VIRTUAL_ADDRESS va, size_t offset, size_t size, uint8_t value) {
     if (size == 0) {
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
     const uint32_t val32 = (uint32_t) value * 0x01010101u;
 
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "memset", hlsl_memset,
-                                                        { "BYTES_PER_THREAD=" + std::to_string(D3D12_MEMSET_BYTES_PER_THREAD) });
-    ggml_d3d12_begin(dev, true);
-    // chunk so that offsets inside a chunk fit in 32 bits; chunks start at 256-byte aligned addresses
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "memset", hlsl_memset,
+                                                        { "BYTES_PER_THREAD=" + std::to_string(D3D11_MEMSET_BYTES_PER_THREAD) });
+    ggml_d3d11_begin(dev, true);
     const size_t chunk_max = 1ull << 30;
     size_t done = 0;
     while (done < size) {
         const size_t   abs_off   = offset + done;
-        const size_t   base      = abs_off & ~((size_t) D3D12_BINDING_ALIGNMENT - 1);
+        const size_t   base      = abs_off & ~((size_t) D3D11_BINDING_ALIGNMENT - 1);
         const uint32_t rel_off   = (uint32_t) (abs_off - base);
         const uint32_t n         = (uint32_t) std::min(size - done, chunk_max);
-        const uint32_t span      = rel_off + n;   // bytes covered from `base`
-        const uint32_t threads   = CEIL_DIV(span, (uint32_t) D3D12_MEMSET_BYTES_PER_THREAD);
-        ggml_d3d12_dispatch(dev, pipeline, { rel_off, n, val32 }, { va + base }, CEIL_DIV(threads, (uint32_t) D3D12_WG_SIZE));
+        const uint32_t span      = rel_off + n;
+        const uint32_t threads   = CEIL_DIV(span, (uint32_t) D3D11_MEMSET_BYTES_PER_THREAD);
+        ggml_d3d11_dispatch(dev, pipeline, { rel_off, n, val32 }, { va + base }, CEIL_DIV(threads, (uint32_t) D3D11_WG_SIZE));
         done += n;
     }
-    ggml_d3d12_submit_and_wait(dev);
+    ggml_d3d11_submit_and_wait(dev);
 }
 
 /* Op encoders */
 
-static std::string ggml_d3d12_type_define(ggml_type type, const char * prefix) {
+static std::string ggml_d3d11_type_define(ggml_type type, const char * prefix) {
     std::string s = prefix;
     switch (type) {
         case GGML_TYPE_F32: s += "_F32"; break;
         case GGML_TYPE_F16: s += "_F16"; break;
         case GGML_TYPE_I32: s += "_I32"; break;
-        default: GGML_ABORT("ggml_d3d12: unsupported type %s", ggml_type_name(type));
+        default: GGML_ABORT("ggml_d3d11: unsupported type %s", ggml_type_name(type));
     }
     return s;
 }
 
-static void ggml_d3d12_cpy(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    std::vector<std::string> defines = { ggml_d3d12_type_define(src->type, "SRC"), ggml_d3d12_type_define(dst->type, "DST") };
+static void ggml_d3d11_cpy(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines = { ggml_d3d11_type_define(src->type, "SRC"), ggml_d3d11_type_define(dst->type, "DST") };
     if (src->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cpy", hlsl_cpy, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "cpy", hlsl_cpy, defines);
 
-    const d3d12_binding bsrc = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bdst = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bsrc = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bdst = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne   = (uint32_t) ggml_nelements(dst);
     const size_t        ts   = ggml_type_size(src->type);
     const size_t        td   = ggml_type_size(dst->type);
@@ -864,27 +959,27 @@ static void ggml_d3d12_cpy(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tenso
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bsrc.va, bdst.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bsrc.va, bdst.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_binary_op(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_d3d11_binary_op(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
     const char * op_define = nullptr;
     switch (dst->op) {
         case GGML_OP_ADD: op_define = "OP_ADD"; break;
         case GGML_OP_SUB: op_define = "OP_SUB"; break;
         case GGML_OP_MUL: op_define = "OP_MUL"; break;
         case GGML_OP_DIV: op_define = "OP_DIV"; break;
-        default: GGML_ABORT("ggml_d3d12: unexpected binary op");
+        default: GGML_ABORT("ggml_d3d11: unexpected binary op");
     }
-    std::vector<std::string> defines = { ggml_d3d12_type_define(dst->type, "TYPE"), op_define };
+    std::vector<std::string> defines = { ggml_d3d11_type_define(dst->type, "TYPE"), op_define };
     if (dst->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "binary", hlsl_binary, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "binary", hlsl_binary, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const size_t        t0 = ggml_type_size(src0->type);
     const size_t        t1 = ggml_type_size(src1->type);
@@ -896,14 +991,14 @@ static void ggml_d3d12_binary_op(d3d12_device_ctx & dev, ggml_tensor * src0, ggm
         (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
         (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2], (uint32_t) src1->ne[3],
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_scale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "scale", hlsl_scale, {});
+static void ggml_d3d11_scale(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "scale", hlsl_scale, {});
 
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        td = ggml_type_size(dst->type);
@@ -913,23 +1008,23 @@ static void ggml_d3d12_scale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_ten
         (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
         (uint32_t) (dst->nb[1] / td), (uint32_t) (dst->nb[2] / td), (uint32_t) (dst->nb[3] / td),
         ne, (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),   // scale
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 1)),   // bias
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),   // scale
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 1)),   // bias
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // SET_ROWS into q8_0 (quantized KV cache): two dispatches, rows of even and odd dst row numbers
-static void ggml_d3d12_set_rows_q8_0(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+static void ggml_d3d11_set_rows_q8_0(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (idx->type == GGML_TYPE_I64) {
         defines.push_back("I64_IDX");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "set_rows_q8", hlsl_set_rows_q8, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "set_rows_q8", hlsl_set_rows_q8, defines);
 
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(idx);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        ti = ggml_type_size(idx->type);
     const size_t        td = ggml_type_size(dst->type);
@@ -945,30 +1040,30 @@ static void ggml_d3d12_set_rows_q8_0(d3d12_device_ctx & dev, ggml_tensor * src, 
     };
     for (uint32_t parity = 0; parity < 2; parity++) {
         params.back() = parity;
-        ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_rows, (uint32_t) D3D12_WG_SIZE));
+        ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_rows, (uint32_t) D3D11_WG_SIZE));
     }
 }
 
-static void ggml_d3d12_set_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+static void ggml_d3d11_set_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
     if (ggml_is_empty(src) || ggml_is_empty(idx)) {
         return;
     }
     if (dst->type == GGML_TYPE_Q8_0) {
-        ggml_d3d12_set_rows_q8_0(dev, src, idx, dst);
+        ggml_d3d11_set_rows_q8_0(dev, src, idx, dst);
         return;
     }
-    std::vector<std::string> defines = { ggml_d3d12_type_define(dst->type, "DST") };
+    std::vector<std::string> defines = { ggml_d3d11_type_define(dst->type, "DST") };
     if (dst->type == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
     }
     if (idx->type == GGML_TYPE_I64) {
         defines.push_back("I64_IDX");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "set_rows", hlsl_set_rows, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "set_rows", hlsl_set_rows, defines);
 
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(idx);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        ti = ggml_type_size(idx->type);
     const size_t        td = ggml_type_size(dst->type);
@@ -982,10 +1077,10 @@ static void ggml_d3d12_set_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
         (uint32_t) idx->ne[1], (uint32_t) idx->ne[2],
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
+static bool ggml_d3d11_mul_mat_vec_type(ggml_type t) {
     switch (t) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
@@ -1017,14 +1112,14 @@ static bool ggml_d3d12_mul_mat_vec_type(ggml_type t) {
 }
 
 // one matrix of a fused mul_mat_vec dispatch: dst = src0 * src1 (+ add, broadcast like ggml_add)
-struct d3d12_mat_slot {
+struct d3d11_mat_slot {
     ggml_tensor * src0;
     ggml_tensor * dst;   // the MUL_MAT node, or the fused ADD node
     ggml_tensor * add;   // addend of the fused ADD, or null
 };
 
 // types the tiled prompt kernel dequantizes (mul_mat_tiled.hlsl)
-static bool ggml_d3d12_tiled_type(ggml_type t) {
+static bool ggml_d3d11_tiled_type(ggml_type t) {
     switch (t) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
@@ -1057,15 +1152,15 @@ static bool ggml_d3d12_tiled_type(ggml_type t) {
 
 // Is this product worth the tiled kernel, and can that kernel express it? Long prompts only: for a
 // handful of columns the matvec kernel wins, because a tile of 32 columns would be mostly padding.
-static bool ggml_d3d12_use_tiled(const d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static bool ggml_d3d11_use_tiled(const d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                  ggml_tensor * dst) {
     return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols &&
-           ggml_d3d12_tiled_type(src0->type) && src0->ne[0] % 32 == 0 &&
+           ggml_d3d11_tiled_type(src0->type) && src0->ne[0] % 32 == 0 &&
            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32;
 }
 
 // dst = src0 * src1 with a TILE_M x TILE_N tile of dst per workgroup; see mul_mat_tiled.hlsl
-static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_mul_mat_tiled(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                      ggml_tensor * dst) {
     std::string define = "SRC0_";
     define += ggml_type_name(src0->type);
@@ -1076,11 +1171,11 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        t0 = ggml_type_size(src0->type);
     const size_t        t1 = ggml_type_size(src1->type);
 
@@ -1100,17 +1195,17 @@ static void ggml_d3d12_mul_mat_tiled(d3d12_device_ctx & dev, ggml_tensor * src0,
     const uint32_t tiles_m  = CEIL_DIV((uint32_t) dst->ne[0], 64u);
     const uint32_t tiles_n  = CEIL_DIV((uint32_t) dst->ne[1], 32u);
     const uint32_t batches  = (uint32_t) (dst->ne[2] * dst->ne[3]);
-    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va }, tiles_m * tiles_n * batches);
 }
 
 // up to 3 matrices sharing src1 in one dispatch; every matrix owns a range of workgroups
-static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d12_mat_slot> & mats) {
+static void ggml_d3d11_mul_mat_group(d3d11_device_ctx & dev, ggml_tensor * src1, const std::vector<d3d11_mat_slot> & mats) {
     GGML_ASSERT(!mats.empty() && mats.size() <= 3);
     ggml_tensor * src0 = mats[0].src0;
     // a single unfused product with many columns goes to the tiled kernel instead
     if (mats.size() == 1 && mats[0].add == nullptr &&
-        ggml_d3d12_use_tiled(dev, src0, src1, mats[0].dst)) {
-        ggml_d3d12_mul_mat_tiled(dev, src0, src1, mats[0].dst);
+        ggml_d3d11_use_tiled(dev, src0, src1, mats[0].dst)) {
+        ggml_d3d11_mul_mat_tiled(dev, src0, src1, mats[0].dst);
         return;
     }
     std::string define = "SRC0_";
@@ -1121,7 +1216,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // threads per row: one unit of work (4 floats or one 32-wide block) per thread, power of two, at most WG_SIZE
     const uint32_t units = (uint32_t) (ggml_is_quantized(src0->type) ? src0->ne[0] / 32 : src0->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < dev.mm_tpr_max) {
+    while (tpr < units && tpr < D3D11_WG_SIZE && tpr < dev.mm_tpr_max) {
         tpr *= 2;
     }
     bool fuse_add = false;
@@ -1147,10 +1242,10 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
-    const uint32_t rows_per_wg = D3D12_WG_SIZE / tpr;
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
+    const uint32_t rows_per_wg = D3D11_WG_SIZE / tpr;
 
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
     const size_t        t0 = ggml_type_size(src0->type);   // block size in bytes for quant types
     const size_t        t1 = ggml_type_size(src1->type);
     ggml_tensor * dst0 = mats[0].dst;
@@ -1164,7 +1259,7 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
         0, 0 // wg_start_1, wg_start_2
     };
     const size_t col0_idx = 10;
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> uavs = { b1.va };
+    std::vector<D3D11_GPU_VIRTUAL_ADDRESS> uavs = { b1.va };
     uint32_t total_wg = 0;
     for (size_t i = 0; i < 3; i++) {
         if (i >= mats.size()) {
@@ -1173,10 +1268,10 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
             }
             continue;
         }
-        const d3d12_mat_slot & m  = mats[i];
-        const d3d12_binding    b0 = ggml_d3d12_bind_tensor(m.src0);
-        const d3d12_binding    bd = ggml_d3d12_bind_tensor(m.dst);
-        const d3d12_binding    ba = m.add ? ggml_d3d12_bind_tensor(m.add) : bd;
+        const d3d11_mat_slot & m  = mats[i];
+        const d3d11_binding    b0 = ggml_d3d11_bind_tensor(m.src0);
+        const d3d11_binding    bd = ggml_d3d11_bind_tensor(m.dst);
+        const d3d11_binding    ba = m.add ? ggml_d3d11_bind_tensor(m.add) : d3d11_binding{ 0, 0 };
         if (i > 0) {
             params[10 + i] = total_wg;
         }
@@ -1193,21 +1288,21 @@ static void ggml_d3d12_mul_mat_group(d3d12_device_ctx & dev, ggml_tensor * src1,
     // columns are processed 4 at a time; every chunk re-reads src0 (fine for decode, slow for long prompts)
     for (uint32_t col0 = 0; col0 < (uint32_t) dst0->ne[1]; col0 += max_cols) {
         params[col0_idx] = col0;
-        ggml_d3d12_dispatch(dev, pipeline, params, uavs, total_wg);
+        ggml_d3d11_dispatch(dev, pipeline, params, uavs, total_wg);
     }
 }
 
 // MUL_MAT_ID: dst[:, slot, token] = as[:, :, ids[slot, token]]^T * src1[:, slot % ne11, token]
 // mul_mat_id for long prompts: group the (token, slot) pairs by expert, then one tiled product per expert
 // tile. The same plan as mm_ids_helper + mmq in the CUDA backend. Returns false when not eligible.
-static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
+static bool ggml_d3d11_mul_mat_id_tiled(d3d11_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
                                         ggml_tensor * dst) {
     const uint32_t n_used    = (uint32_t) ids->ne[0];
     const uint32_t n_tokens  = (uint32_t) ids->ne[1];
     const uint32_t n_experts = (uint32_t) as->ne[2];
     // MAX_EXPERTS in mul_mat_id_prep.hlsl
     if (dev.tiled_min_cols == 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
-        !ggml_d3d12_tiled_type(as->type) || as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 ||
+        !ggml_d3d11_tiled_type(as->type) || as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 ||
         dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -1217,18 +1312,18 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     const size_t   need      = (size_t) (list_base + n_pairs) * 4;
     if (!dev.collecting && need > dev.mmid_scratch_size) {
         // commands already recorded may still use the old buffer: run them before it is replaced
-        ggml_d3d12_submit_and_wait(dev);
-        ggml_d3d12_begin(dev, true);
+        ggml_d3d11_submit_and_wait(dev);
+        ggml_d3d11_begin(dev, true);
         const size_t size = std::max(need, dev.mmid_scratch_size * 2);
-        dev.mmid_scratch  = ggml_d3d12_create_buffer(dev, size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12 mmid scratch");
+        dev.mmid_scratch  = ggml_d3d11_create_buffer(dev, size, D3D11_HEAP_TYPE_DEFAULT, L"ggml_d3d11 mmid scratch");
         GGML_ASSERT(dev.mmid_scratch);
         dev.mmid_scratch_size = size;
     }
-    const D3D12_GPU_VIRTUAL_ADDRESS scratch_va = dev.mmid_scratch ? dev.mmid_scratch->GetGPUVirtualAddress() : 0;
+    const D3D11_GPU_VIRTUAL_ADDRESS scratch_va = dev.mmid_scratch ? dev.mmid_scratch->GetGPUVirtualAddress() : 0;
 
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
-    d3d12_pipeline & prep = ggml_d3d12_get_pipeline(dev, "mul_mat_id_prep", hlsl_mul_mat_id_prep, {});
-    ggml_d3d12_dispatch(dev, prep, { bi.elem_offset, (uint32_t) (ids->nb[1] / 4), n_used, n_tokens, n_experts, list_base },
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(ids);
+    d3d11_pipeline & prep = ggml_d3d11_get_pipeline(dev, "mul_mat_id_prep", hlsl_mul_mat_id_prep, {});
+    ggml_d3d11_dispatch(dev, prep, { bi.elem_offset, (uint32_t) (ids->nb[1] / 4), n_used, n_tokens, n_experts, list_base },
                         { bi.va, scratch_va }, 1);
 
     std::string define = "SRC0_";
@@ -1236,11 +1331,11 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, { define, "MMID" });
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_tiled", hlsl_mul_mat_tiled, { define, "MMID" });
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(as);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        t0 = ggml_type_size(as->type);
 
     std::vector<uint32_t> params = {
@@ -1253,11 +1348,11 @@ static bool ggml_d3d12_mul_mat_id_tiled(d3d12_device_ctx & dev, ggml_tensor * as
     };
     // TILE_M in mul_mat_tiled.hlsl; workgroups past the real tile count do nothing
     const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], 64u);
-    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va, scratch_va }, tiles_m * max_tiles);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va, scratch_va }, tiles_m * max_tiles);
     return true;
 }
 
-static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
+static void ggml_d3d11_mul_mat_id(d3d11_device_ctx & dev, ggml_tensor * as, ggml_tensor * src1, ggml_tensor * ids,
                                   ggml_tensor * dst) {
     std::string define = "SRC0_";
     define += ggml_type_name(as->type);
@@ -1266,19 +1361,19 @@ static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml
     }
     const uint32_t units = (uint32_t) (ggml_is_quantized(as->type) ? as->ne[0] / 32 : as->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < D3D12_WG_SIZE && tpr < dev.mm_tpr_max) {
+    while (tpr < units && tpr < D3D11_WG_SIZE && tpr < dev.mm_tpr_max) {
         tpr *= 2;
     }
-    if (ggml_d3d12_mul_mat_id_tiled(dev, as, src1, ids, dst)) {
+    if (ggml_d3d11_mul_mat_id_tiled(dev, as, src1, ids, dst)) {
         return;
     }
     std::vector<std::string> defines = { define, "TPR=" + std::to_string(tpr), "N_MATS=1", "MMID" };
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "mul_mat_vec", hlsl_mul_mat_vec, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(as);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(as);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(ids);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        t0 = ggml_type_size(as->type);
     const size_t        t1 = ggml_type_size(src1->type);
 
@@ -1303,18 +1398,18 @@ static void ggml_d3d12_mul_mat_id(d3d12_device_ctx & dev, ggml_tensor * as, ggml
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
     });
 
-    const uint32_t rows_per_wg = D3D12_WG_SIZE / tpr;
+    const uint32_t rows_per_wg = D3D11_WG_SIZE / tpr;
     const uint32_t total_wg    = CEIL_DIV((uint32_t) as->ne[1], rows_per_wg) *
                                  (uint32_t) (ids->ne[0] * ids->ne[1]);
-    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va, bd.va, bi.va }, total_wg);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, b0.va, bd.va, 0, bi.va }, total_wg);
 }
 
-static void ggml_d3d12_mul_mat(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    ggml_d3d12_mul_mat_group(dev, src1, { { src0, dst, nullptr } });
+static void ggml_d3d11_mul_mat(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_d3d11_mul_mat_group(dev, src1, { { src0, dst, nullptr } });
 }
 
 // can `add_node` (an ADD consuming `mm`) be folded into the matvec that produces `mm`? returns the addend
-static ggml_tensor * ggml_d3d12_fusable_addend(const ggml_tensor * mm, const ggml_tensor * add_node) {
+static ggml_tensor * ggml_d3d11_fusable_addend(const ggml_tensor * mm, const ggml_tensor * add_node) {
     if (add_node->src[0] != mm && add_node->src[1] != mm) {
         return nullptr;
     }
@@ -1339,17 +1434,18 @@ static ggml_tensor * ggml_d3d12_fusable_addend(const ggml_tensor * mm, const ggm
 
 // encode the MUL_MAT at node i together with up to two following MUL_MATs that share src1, each with its
 // optional bias/residual ADD; returns the number of graph nodes consumed
-static int ggml_d3d12_encode_mul_mat_group(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+static int ggml_d3d11_encode_mul_mat_group(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * first = cgraph->nodes[i];
     ggml_tensor * src1  = first->src[1];
-    // long prompts: the tiled kernel alone, no grouping or ADD fusion (the matvec path made pp512 7x slower on the S80)
-    if (ggml_d3d12_use_tiled(dev, first->src[0], src1, first)) {
-        ggml_d3d12_mul_mat_tiled(dev, first->src[0], src1, first);
+    // long prompts: the tiled kernel alone, no grouping or ADD fusion (the matvec path made pp512 up to 25x slower)
+    if (ggml_d3d11_use_tiled(dev, first->src[0], src1, first)) {
+        ggml_d3d11_mul_mat_tiled(dev, first->src[0], src1, first);
         return 1;
     }
-    std::vector<d3d12_mat_slot> mats;
+    std::vector<d3d11_mat_slot> mats;
     int j = i;
-    const size_t max_mats = dev.no_fuse ? 1 : 3;
+    // D3D11: a group writes several dst tensors that share a buffer, and all but the last slot would be copies
+    const size_t max_mats = 1;
     while (j < cgraph->n_nodes && mats.size() < max_mats) {
         ggml_tensor * node = cgraph->nodes[j];
         if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 || node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
@@ -1365,10 +1461,10 @@ static int ggml_d3d12_encode_mul_mat_group(d3d12_device_ctx & dev, const ggml_cg
         if (!independent) {
             break;
         }
-        d3d12_mat_slot slot = { node->src[0], node, nullptr };
+        d3d11_mat_slot slot = { node->src[0], node, nullptr };
         int consumed = 1;
         if (!dev.no_fuse && ggml_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
-            ggml_tensor * addend = ggml_d3d12_fusable_addend(node, cgraph->nodes[j + 1]);
+            ggml_tensor * addend = ggml_d3d11_fusable_addend(node, cgraph->nodes[j + 1]);
             bool ok = addend != nullptr;
             for (const auto & m : mats) {
                 ok = ok && addend != m.dst && addend != m.src0;
@@ -1384,14 +1480,14 @@ static int ggml_d3d12_encode_mul_mat_group(d3d12_device_ctx & dev, const ggml_cg
     }
     if (mats.empty()) {
         // first node did not pass the group checks (e.g. non-contiguous dst): plain path
-        ggml_d3d12_mul_mat(dev, first->src[0], src1, first);
+        ggml_d3d11_mul_mat(dev, first->src[0], src1, first);
         return 1;
     }
-    ggml_d3d12_mul_mat_group(dev, src1, mats);
+    ggml_d3d11_mul_mat_group(dev, src1, mats);
     return j - i;
 }
 
-static const char * ggml_d3d12_float_type_define(ggml_type t, std::vector<std::string> & defines) {
+static const char * ggml_d3d11_float_type_define(ggml_type t, std::vector<std::string> & defines) {
     defines.push_back(t == GGML_TYPE_F16 ? "TYPE_F16" : "TYPE_F32");
     if (t == GGML_TYPE_F16) {
         defines.push_back("USE_16BIT");
@@ -1400,7 +1496,7 @@ static const char * ggml_d3d12_float_type_define(ggml_type t, std::vector<std::s
 }
 
 // rms_norm, optionally fused with a following MUL by `wgt` (then `dst` is the MUL node and `norm` the RMS_NORM node)
-static void ggml_d3d12_rms_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * norm, ggml_tensor * dst, ggml_tensor * wgt) {
+static void ggml_d3d11_rms_norm(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * norm, ggml_tensor * dst, ggml_tensor * wgt) {
     std::vector<std::string> defines;
     if (wgt) {
         defines.push_back("FUSE_MUL");
@@ -1408,61 +1504,61 @@ static void ggml_d3d12_rms_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
     if (norm->op == GGML_OP_L2_NORM) {
         defines.push_back("L2_NORM");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rms_norm", hlsl_rms_norm, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
-    const d3d12_binding bw = wgt ? ggml_d3d12_bind_tensor(wgt) : bd;
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "rms_norm", hlsl_rms_norm, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
+    const d3d11_binding bw = wgt ? ggml_d3d11_bind_tensor(wgt) : d3d11_binding{ 0, 0 };
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(norm, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(norm, 0)),
         bw.elem_offset,
         wgt ? (uint32_t) wgt->ne[1] : 1u, wgt ? (uint32_t) wgt->ne[2] : 1u, wgt ? (uint32_t) wgt->ne[3] : 1u,
         wgt ? (uint32_t) (wgt->nb[1] / 4) : 0u, wgt ? (uint32_t) (wgt->nb[2] / 4) : 0u, wgt ? (uint32_t) (wgt->nb[3] / 4) : 0u,
     };
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> uavs = { bs.va, bd.va };
+    std::vector<D3D11_GPU_VIRTUAL_ADDRESS> uavs = { bs.va, bd.va };
     if (wgt) {
         uavs.push_back(bw.va);
     }
-    ggml_d3d12_dispatch(dev, pipeline, params, uavs, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, uavs, n_rows);
 }
 
 // ARGSORT and TOP_K share one kernel; TOP_K keeps the k largest (dst->ne[0]) in no particular order
-static void ggml_d3d12_argsort(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_argsort(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (dst->op == GGML_OP_TOP_K || (ggml_sort_order) ggml_get_op_params_i32(dst, 0) == GGML_SORT_ORDER_DESC) {
         defines.push_back("SORT_DESC");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "argsort", hlsl_argsort, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "argsort", hlsl_argsort, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(src);
     std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset, (uint32_t) (src->nb[1] / 4), (uint32_t) src->ne[0], (uint32_t) dst->ne[0], 0, 0,
     };
     // every element is compared with its whole row: ne0^2 work per row, bounded per command list
     const uint64_t row_work = (uint64_t) src->ne[0] * (uint64_t) src->ne[0];
-    const uint32_t chunk    = (uint32_t) std::max<uint64_t>(1, D3D12_FLASH_ATTN_WORK / row_work);
-    const bool     big      = (uint64_t) n_rows * row_work > D3D12_FLASH_ATTN_WORK;
+    const uint32_t chunk    = (uint32_t) std::max<uint64_t>(1, D3D11_FLASH_ATTN_WORK / row_work);
+    const bool     big      = (uint64_t) n_rows * row_work > D3D11_FLASH_ATTN_WORK;
     for (uint32_t row0 = 0; row0 < n_rows; row0 += chunk) {
         params[5] = row0;
         params[6] = std::min(chunk, n_rows - row0);
         if (big && dev.dispatches_in_list > 0) {
             dev.n_flush_batch++;
-            ggml_d3d12_submit_and_wait(dev);
-            ggml_d3d12_begin(dev, true);
+            ggml_d3d11_submit_and_wait(dev);
+            ggml_d3d11_begin(dev, true);
         }
-        ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, params[6]);
+        ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, params[6]);
     }
 }
 
-static void ggml_d3d12_repeat(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "repeat", hlsl_repeat, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_repeat(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "repeat", hlsl_repeat, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1471,10 +1567,10 @@ static void ggml_d3d12_repeat(d3d12_device_ctx & dev, ggml_tensor * src, ggml_te
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_im2col(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_im2col(d3d11_device_ctx & dev, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * src    = dst->src[1];
     const int32_t *     op     = (const int32_t *) dst->op_params;
@@ -1484,9 +1580,9 @@ static void ggml_d3d12_im2col(d3d12_device_ctx & dev, ggml_tensor * dst) {
     if (dst->type == GGML_TYPE_F16) {
         defines = { "DST_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "im2col", hlsl_im2col, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "im2col", hlsl_im2col, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1497,10 +1593,10 @@ static void ggml_d3d12_im2col(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) (is_2D ? kernel->ne[1] : 1), (uint32_t) kernel->ne[0],
         (uint32_t) (is_2D ? dst->ne[2] : 1), (uint32_t) dst->ne[1], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_im2col_3d(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_im2col_3d(d3d11_device_ctx & dev, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * src    = dst->src[1];
     const int32_t *     op     = (const int32_t *) dst->op_params;
@@ -1510,9 +1606,9 @@ static void ggml_d3d12_im2col_3d(d3d12_device_ctx & dev, ggml_tensor * dst) {
     if (dst->type == GGML_TYPE_F16) {
         defines = { "DST_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "im2col_3d", hlsl_im2col_3d, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "im2col_3d", hlsl_im2col_3d, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      N  = (uint32_t) (src->ne[3] / IC);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -1524,10 +1620,10 @@ static void ggml_d3d12_im2col_3d(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) kernel->ne[2], (uint32_t) kernel->ne[1], (uint32_t) kernel->ne[0],
         (uint32_t) (dst->ne[3] / N), (uint32_t) dst->ne[2], (uint32_t) dst->ne[1], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_upscale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_upscale(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     const int32_t mode_flags = ggml_get_op_params_i32(dst, 0);
     float sf0 = (float) dst->ne[0] / src->ne[0];
     float sf1 = (float) dst->ne[1] / src->ne[1];
@@ -1543,9 +1639,9 @@ static void ggml_d3d12_upscale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
     if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR) {
         defines.push_back("BILINEAR");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "upscale", hlsl_upscale, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "upscale", hlsl_upscale, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1553,13 +1649,13 @@ static void ggml_d3d12_upscale(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
         (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
-        ggml_d3d12_u32_from_f32(sf0), ggml_d3d12_u32_from_f32(sf1), ggml_d3d12_u32_from_f32(sf2), ggml_d3d12_u32_from_f32(sf3),
-        ggml_d3d12_u32_from_f32(pixel_offset),
+        ggml_d3d11_u32_from_f32(sf0), ggml_d3d11_u32_from_f32(sf1), ggml_d3d11_u32_from_f32(sf2), ggml_d3d11_u32_from_f32(sf3),
+        ggml_d3d11_u32_from_f32(pixel_offset),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_pool_2d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_pool_2d(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     const int32_t * op = (const int32_t *) dst->op_params;
     std::vector<std::string> defines;
     if (src->type == GGML_TYPE_F16) {
@@ -1568,9 +1664,9 @@ static void ggml_d3d12_pool_2d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
     if ((ggml_op_pool) op[0] == GGML_OP_POOL_MAX) {
         defines.push_back("POOL_MAX");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "pool_2d", hlsl_pool_2d, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "pool_2d", hlsl_pool_2d, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -1580,39 +1676,39 @@ static void ggml_d3d12_pool_2d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
         (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4], (uint32_t) op[5], (uint32_t) op[6],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // FILL: the memset kernel with the constant's bit pattern (f16: the half value twice per word)
-static void ggml_d3d12_fill(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_fill(d3d11_device_ctx & dev, ggml_tensor * dst) {
     const float c = ggml_get_op_params_f32(dst, 0);
     uint32_t pattern;
     if (dst->type == GGML_TYPE_F16) {
         const uint32_t h = ggml_fp32_to_fp16(c);
         pattern = h | (h << 16);
     } else {
-        pattern = ggml_d3d12_u32_from_f32(c);
+        pattern = ggml_d3d11_u32_from_f32(c);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "memset", hlsl_memset,
-                                                        { "BYTES_PER_THREAD=" + std::to_string(D3D12_MEMSET_BYTES_PER_THREAD) });
-    const size_t   offset = ggml_d3d12_tensor_offset(dst);
-    const size_t   base   = offset & ~((size_t) D3D12_BINDING_ALIGNMENT - 1);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "memset", hlsl_memset,
+                                                        { "BYTES_PER_THREAD=" + std::to_string(D3D11_MEMSET_BYTES_PER_THREAD) });
+    const size_t   offset = ggml_d3d11_tensor_offset(dst);
+    const size_t   base   = offset & ~((size_t) D3D11_BINDING_ALIGNMENT - 1);
     const uint32_t rel    = (uint32_t) (offset - base);
     const uint32_t n      = (uint32_t) ggml_nbytes(dst);
-    const uint32_t threads = CEIL_DIV(rel + n, (uint32_t) D3D12_MEMSET_BYTES_PER_THREAD);
-    ggml_d3d12_dispatch(dev, pipeline, { rel, n, pattern }, { ggml_d3d12_tensor_va(dst) + base },
-                        CEIL_DIV(threads, (uint32_t) D3D12_WG_SIZE));
+    const uint32_t threads = CEIL_DIV(rel + n, (uint32_t) D3D11_MEMSET_BYTES_PER_THREAD);
+    ggml_d3d11_dispatch(dev, pipeline, { rel, n, pattern }, { ggml_d3d11_tensor_va(dst) + base },
+                        CEIL_DIV(threads, (uint32_t) D3D11_WG_SIZE));
 }
 
 // MEAN reuses the sum_rows kernel, which divides by the row length when MEAN is defined
-static void ggml_d3d12_sum_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool mean = false) {
+static void ggml_d3d11_sum_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool mean = false) {
     std::vector<std::string> defines;
     if (mean) {
         defines.push_back("MEAN");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, mean ? "sum_rows_mean" : "sum_rows", hlsl_sum_rows, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, mean ? "sum_rows_mean" : "sum_rows", hlsl_sum_rows, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(src);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1620,69 +1716,69 @@ static void ggml_d3d12_sum_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // SUM: every element of src into one scalar, a single workgroup walking the whole tensor
-static void ggml_d3d12_sum(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "sum", hlsl_sum, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_sum(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "sum", hlsl_sum, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
         (uint32_t) ggml_nrows(src),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, 1);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, 1);
 }
 
 // ARGMAX: index of the largest element of each row, one workgroup per row
-static void ggml_d3d12_argmax(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "argmax", hlsl_argmax, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_argmax(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "argmax", hlsl_argmax, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) src->ne[1];
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4),
         (uint32_t) src->ne[0], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // ARANGE: no input tensor, dst[i] = start + step * i
-static void ggml_d3d12_arange(d3d12_device_ctx & dev, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "arange", hlsl_arange, {});
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_arange(d3d11_device_ctx & dev, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "arange", hlsl_arange, {});
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const float start = ggml_get_op_params_f32(dst, 0);
     const float step  = ggml_get_op_params_f32(dst, 2);
     const std::vector<uint32_t> params = {
-        bd.elem_offset, ne, ggml_d3d12_u32_from_f32(start), ggml_d3d12_u32_from_f32(step),
+        bd.elem_offset, ne, ggml_d3d11_u32_from_f32(start), ggml_d3d11_u32_from_f32(step),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // DIAG_MASK_INF / DIAG_MASK_ZERO: copy src and replace everything right of the shifted diagonal
-static void ggml_d3d12_diag_mask(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, float value) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "diag_mask", hlsl_diag_mask, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_diag_mask(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, float value) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "diag_mask", hlsl_diag_mask, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset, ne,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
-        (uint32_t) ggml_get_op_params_i32(dst, 0), ggml_d3d12_u32_from_f32(value),
+        (uint32_t) ggml_get_op_params_i32(dst, 0), ggml_d3d11_u32_from_f32(value),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // ROLL: cyclic shift along all four axes, one workgroup per destination row
-static void ggml_d3d12_roll(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "roll", hlsl_roll, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_roll(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "roll", hlsl_roll, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1693,20 +1789,20 @@ static void ggml_d3d12_roll(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tens
         (uint32_t) ggml_get_op_params_i32(dst, 2), (uint32_t) ggml_get_op_params_i32(dst, 3),
         n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // PAD: src copied into a larger dst at the left pads; outside, zero or a wrapped source element
-static void ggml_d3d12_pad(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_pad(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     const bool circular = ggml_get_op_params_i32(dst, 8) != 0;
     std::vector<std::string> defines;
     if (circular) {
         defines.push_back("CIRCULAR");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, circular ? "pad_circular" : "pad", hlsl_pad, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, circular ? "pad_circular" : "pad", hlsl_pad, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1717,14 +1813,14 @@ static void ggml_d3d12_pad(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tenso
         (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
         (uint32_t) ggml_get_op_params_i32(dst, 4), (uint32_t) ggml_get_op_params_i32(dst, 6),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // PAD_REFLECT_1D: mirror the row into both margins, one workgroup per row
-static void ggml_d3d12_pad_reflect_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "pad_reflect_1d", hlsl_pad_reflect_1d, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_pad_reflect_1d(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "pad_reflect_1d", hlsl_pad_reflect_1d, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1733,40 +1829,40 @@ static void ggml_d3d12_pad_reflect_1d(d3d12_device_ctx & dev, ggml_tensor * src,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         (uint32_t) src->ne[0], (uint32_t) ggml_get_op_params_i32(dst, 0), n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // TIMESTEP_EMBEDDING: cos/sin ladder per input timestep, one workgroup per timestep
-static void ggml_d3d12_timestep_embedding(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, "timestep_embedding", hlsl_timestep_embedding, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_timestep_embedding(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, "timestep_embedding", hlsl_timestep_embedding, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      dim        = (uint32_t) ggml_get_op_params_i32(dst, 0);
     const uint32_t      max_period = (uint32_t) ggml_get_op_params_i32(dst, 1);
     const uint32_t      ne00       = (uint32_t) src->ne[0];
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset, (uint32_t) (dst->nb[1] / 4),
-        ne00, dim / 2, dim, ggml_d3d12_u32_from_f32(-logf((float) max_period)),
+        ne00, dim / 2, dim, ggml_d3d11_u32_from_f32(-logf((float) max_period)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, ne00);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, ne00);
 }
 
 // SET / ACC: dst takes a copy of src0, then src1 lands in the view described by op_params.
 // Two dispatches, because the copy has to be complete before the scatter overwrites part of it.
-static void ggml_d3d12_set_acc(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_set_acc(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                ggml_tensor * dst, bool acc) {
     if (src0->data != dst->data) {
-        ggml_d3d12_cpy(dev, src0, dst);
+        ggml_d3d11_cpy(dev, src0, dst);
     }
     std::vector<std::string> defines;
     if (acc) {
         defines.push_back("ACC");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, acc ? "set_acc_add" : "set_acc", hlsl_set_acc, defines);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, acc ? "set_acc_add" : "set_acc", hlsl_set_acc, defines);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(src1);
     // the view strides and offset are byte counts in op_params; the kernel indexes in elements
     const std::vector<uint32_t> params = {
@@ -1777,14 +1873,14 @@ static void ggml_d3d12_set_acc(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_
         (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], (uint32_t) src1->ne[2],
         n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b1.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b1.va, bd.va }, n_rows);
 }
 
 // CUMSUM: inclusive prefix sum along each row
-static void ggml_d3d12_cumsum(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cumsum", hlsl_cumsum, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_cumsum(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "cumsum", hlsl_cumsum, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(src);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1792,14 +1888,14 @@ static void ggml_d3d12_cumsum(d3d12_device_ctx & dev, ggml_tensor * src, ggml_te
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // TRI: keep one triangle of each matrix, zero the rest
-static void ggml_d3d12_tri(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "tri", hlsl_tri, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_tri(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "tri", hlsl_tri, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1808,16 +1904,16 @@ static void ggml_d3d12_tri(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tenso
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
         (uint32_t) ggml_get_op_params_i32(dst, 0),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // COUNT_EQUAL: number of positions where the two i32 tensors agree, into an i64 scalar
-static void ggml_d3d12_count_equal(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_count_equal(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                    ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "count_equal", hlsl_count_equal, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "count_equal", hlsl_count_equal, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, bd.elem_offset * (uint32_t) ggml_type_size(dst->type),
         (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
@@ -1825,16 +1921,16 @@ static void ggml_d3d12_count_equal(d3d12_device_ctx & dev, ggml_tensor * src0, g
         (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
         (uint32_t) ggml_nrows(src0),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
 }
 
 // ADD1: dst = src0 plus a scalar that lives in device memory
-static void ggml_d3d12_add1(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_add1(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                             ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "add1", hlsl_add1, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "add1", hlsl_add1, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, bd.elem_offset,
@@ -1842,29 +1938,29 @@ static void ggml_d3d12_add1(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_ten
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, n_rows);
 }
 
 // LEAKY_RELU: negative inputs scaled by the slope in op_params
-static void ggml_d3d12_leaky_relu(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "leaky_relu", hlsl_leaky_relu, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_leaky_relu(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "leaky_relu", hlsl_leaky_relu, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
         (uint32_t) dst->ne[0], n_rows,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // GROUP_NORM: one workgroup per (channel group, batch)
-static void ggml_d3d12_group_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "group_norm", hlsl_group_norm, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_group_norm(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "group_norm", hlsl_group_norm, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_channels = (uint32_t) src->ne[2];
     const uint32_t n_groups   = (uint32_t) ggml_get_op_params_i32(dst, 0);
     const uint32_t n_batches  = (uint32_t) src->ne[3];
@@ -1876,16 +1972,16 @@ static void ggml_d3d12_group_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggm
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1],
         n_channels, n_groups, CEIL_DIV(n_channels, n_groups), n_batches,
-        ggml_d3d12_u32_from_f32(eps),
+        ggml_d3d11_u32_from_f32(eps),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_groups * n_batches);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_groups * n_batches);
 }
 
 // DIAG: vector to diagonal matrix, one workgroup per destination row
-static void ggml_d3d12_diag(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "diag", hlsl_diag, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_diag(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "diag", hlsl_diag, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -1893,20 +1989,20 @@ static void ggml_d3d12_diag(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tens
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // POOL_1D: sliding window along the row only
-static void ggml_d3d12_pool_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_pool_1d(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (src->type == GGML_TYPE_F16) {
         defines = { "SRC_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, src->type == GGML_TYPE_F16 ? "pool_1d_f16" : "pool_1d",
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, src->type == GGML_TYPE_F16 ? "pool_1d_f16" : "pool_1d",
                                 hlsl_pool_1d, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const int32_t * opts   = (const int32_t *) dst->op_params;
     const uint32_t  n_rows = (uint32_t) ggml_nrows(src);
     const size_t    ts     = ggml_type_size(src->type);
@@ -1918,10 +2014,10 @@ static void ggml_d3d12_pool_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_t
         (uint32_t) (opts[0] == GGML_OP_POOL_MAX ? 1 : 0),
         n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
-static void ggml_d3d12_dsv4_hc_pre(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_dsv4_hc_pre(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * x = dst->src[0];
     ggml_tensor * w = dst->src[1];
     const bool gated = ggml_get_op_params_i32(dst, 1) != 0;
@@ -1930,11 +2026,11 @@ static void ggml_d3d12_dsv4_hc_pre(d3d12_device_ctx & dev, ggml_tensor * dst) {
     if (gated) {
         defines.push_back("GATED");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, gated ? "dsv4_hc_pre_gated" : "dsv4_hc_pre", hlsl_dsv4_hc_pre, defines);
-    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
-    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, gated ? "dsv4_hc_pre_gated" : "dsv4_hc_pre", hlsl_dsv4_hc_pre, defines);
+    const d3d11_binding bx = ggml_d3d11_bind_tensor(x);
+    const d3d11_binding bw = ggml_d3d11_bind_tensor(w);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bx.elem_offset, bw.elem_offset, bd.elem_offset,
@@ -1942,13 +2038,13 @@ static void ggml_d3d12_dsv4_hc_pre(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) (w->nb[0] / 4), (uint32_t) (w->nb[1] / 4), (uint32_t) (w->nb[2] / 4),
         (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4),
         (uint32_t) x->ne[0], (uint32_t) x->ne[1],
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bx.va, bw.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bx.va, bw.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_dsv4_hc_post(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_dsv4_hc_post(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * x = dst->src[0];
     ggml_tensor * r = dst->src[1];
     ggml_tensor * p = dst->src[2];
@@ -1958,14 +2054,14 @@ static void ggml_d3d12_dsv4_hc_post(d3d12_device_ctx & dev, ggml_tensor * dst) {
     if (c) {
         defines.push_back("HAS_COMB");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, c ? "dsv4_hc_post_comb" : "dsv4_hc_post", hlsl_dsv4_hc_post, defines);
-    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
-    const d3d12_binding br = ggml_d3d12_bind_tensor(r);
-    const d3d12_binding bp = ggml_d3d12_bind_tensor(p);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, c ? "dsv4_hc_post_comb" : "dsv4_hc_post", hlsl_dsv4_hc_post, defines);
+    const d3d11_binding bx = ggml_d3d11_bind_tensor(x);
+    const d3d11_binding br = ggml_d3d11_bind_tensor(r);
+    const d3d11_binding bp = ggml_d3d11_bind_tensor(p);
     // with no comb matrix the slot still has to be bound; the residual stands in and is never read
-    const d3d12_binding bc = ggml_d3d12_bind_tensor(c ? c : r);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bc = ggml_d3d11_bind_tensor(c ? c : r);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bx.elem_offset, br.elem_offset, bp.elem_offset, bc.elem_offset, bd.elem_offset,
@@ -1977,36 +2073,36 @@ static void ggml_d3d12_dsv4_hc_post(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) x->ne[0], (uint32_t) r->ne[1],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bx.va, br.va, bp.va, bc.va, bd.va },
-                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bx.va, br.va, bp.va, bc.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_dsv4_hc_comb(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_dsv4_hc_comb(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * m = dst->src[0];
     ggml_tensor * s = dst->src[1];
     ggml_tensor * b = dst->src[2];
 
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "dsv4_hc_comb", hlsl_dsv4_hc_comb, {});
-    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(s);
-    const d3d12_binding bb = ggml_d3d12_bind_tensor(b);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "dsv4_hc_comb", hlsl_dsv4_hc_comb, {});
+    const d3d11_binding bm = ggml_d3d11_bind_tensor(m);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(s);
+    const d3d11_binding bb = ggml_d3d11_bind_tensor(b);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_tokens = (uint32_t) m->ne[1];
     const std::vector<uint32_t> params = {
         bm.elem_offset, bs.elem_offset, bb.elem_offset, bd.elem_offset,
         (uint32_t) (m->nb[0] / 4), (uint32_t) (m->nb[1] / 4),
         (uint32_t) (s->nb[0] / 4), (uint32_t) (b->nb[0] / 4),
         (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
         (uint32_t) ggml_get_op_params_i32(dst, 1),
         n_tokens,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bm.va, bs.va, bb.va, bd.va },
-                        CEIL_DIV(n_tokens, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bm.va, bs.va, bb.va, bd.va },
+                        CEIL_DIV(n_tokens, (uint32_t) D3D11_WG_SIZE));
 }
 
 // OPT_STEP_SGD / OPT_STEP_ADAMW: dst is a view of src0, so the update lands in src0's own buffer
-static void ggml_d3d12_opt_step(d3d12_device_ctx & dev, ggml_tensor * dst, bool adamw) {
+static void ggml_d3d11_opt_step(d3d11_device_ctx & dev, ggml_tensor * dst, bool adamw) {
     ggml_tensor * w = dst->src[0];
     ggml_tensor * g = dst->src[1];
     ggml_tensor * m = adamw ? dst->src[2] : g;
@@ -2017,35 +2113,42 @@ static void ggml_d3d12_opt_step(d3d12_device_ctx & dev, ggml_tensor * dst, bool 
     if (adamw) {
         defines.push_back("ADAMW");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, adamw ? "opt_step_adamw" : "opt_step_sgd", hlsl_opt_step, defines);
-    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(g);
-    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(v);
-    const d3d12_binding bp = ggml_d3d12_bind_tensor(p);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, adamw ? "opt_step_adamw" : "opt_step_sgd", hlsl_opt_step, defines);
+    // w (and m, v for AdamW) are written in place and are not node outputs: tag them as written.
+    // SGD has no m and v; their slots are null.
+    d3d11_binding       bw = ggml_d3d11_bind_tensor(w);
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(g);
+    d3d11_binding       bm = adamw ? ggml_d3d11_bind_tensor(m) : d3d11_binding{ 0, 0 };
+    d3d11_binding       bv = adamw ? ggml_d3d11_bind_tensor(v) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bp = ggml_d3d11_bind_tensor(p);
+    bw.va |= D3D11_VA_WRITTEN;
+    if (adamw) {
+        bm.va |= D3D11_VA_WRITTEN;
+        bv.va |= D3D11_VA_WRITTEN;
+    }
     const uint32_t ne = (uint32_t) ggml_nelements(w);
     const std::vector<uint32_t> params = {
         bw.elem_offset, bg.elem_offset, bm.elem_offset, bv.elem_offset, bp.elem_offset, ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bw.va, bg.va, bm.va, bv.va, bp.va },
-                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bw.va, bg.va, bm.va, bv.va, bp.va },
+                        CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_silu_back(d3d12_device_ctx & dev, ggml_tensor * dy, ggml_tensor * x, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "silu_back", hlsl_silu_back, {});
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(dy);
-    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_silu_back(d3d11_device_ctx & dev, ggml_tensor * dy, ggml_tensor * x, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "silu_back", hlsl_silu_back, {});
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(dy);
+    const d3d11_binding bx = ggml_d3d11_bind_tensor(x);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = { bg.elem_offset, bx.elem_offset, bd.elem_offset, ne };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, bx.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bg.va, bx.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_repeat_back(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "repeat_back", hlsl_repeat_back, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_repeat_back(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "repeat_back", hlsl_repeat_back, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
@@ -2056,14 +2159,14 @@ static void ggml_d3d12_repeat_back(d3d12_device_ctx & dev, ggml_tensor * src, gg
         (uint32_t) (src->ne[2] / dst->ne[2]), (uint32_t) (src->ne[3] / dst->ne[3]),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_rms_norm_back(d3d12_device_ctx & dev, ggml_tensor * dz, ggml_tensor * x, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rms_norm_back", hlsl_rms_norm_back, {});
-    const d3d12_binding bz = ggml_d3d12_bind_tensor(dz);
-    const d3d12_binding bx = ggml_d3d12_bind_tensor(x);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_rms_norm_back(d3d11_device_ctx & dev, ggml_tensor * dz, ggml_tensor * x, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "rms_norm_back", hlsl_rms_norm_back, {});
+    const d3d11_binding bz = ggml_d3d11_bind_tensor(dz);
+    const d3d11_binding bx = ggml_d3d11_bind_tensor(x);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bz.elem_offset, bx.elem_offset, bd.elem_offset,
@@ -2071,68 +2174,68 @@ static void ggml_d3d12_rms_norm_back(d3d12_device_ctx & dev, ggml_tensor * dz, g
         (uint32_t) (x->nb[1] / 4), (uint32_t) (x->nb[2] / 4), (uint32_t) (x->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bz.va, bx.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bz.va, bx.va, bd.va }, n_rows);
 }
 
-static void ggml_d3d12_soft_max_back(d3d12_device_ctx & dev, ggml_tensor * dy, ggml_tensor * y, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "soft_max_back", hlsl_soft_max_back, {});
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(dy);
-    const d3d12_binding by = ggml_d3d12_bind_tensor(y);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_soft_max_back(d3d11_device_ctx & dev, ggml_tensor * dy, ggml_tensor * y, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "soft_max_back", hlsl_soft_max_back, {});
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(dy);
+    const d3d11_binding by = ggml_d3d11_bind_tensor(y);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bg.elem_offset, by.elem_offset, bd.elem_offset, (uint32_t) dst->ne[0], n_rows,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, by.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bg.va, by.va, bd.va }, n_rows);
 }
 
 // the loss is a single scalar, so the whole reduction runs in one workgroup
-static void ggml_d3d12_cross_entropy_loss(d3d12_device_ctx & dev, ggml_tensor * s0, ggml_tensor * s1, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "cross_entropy_loss", hlsl_cross_entropy_loss, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(s0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(s1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_cross_entropy_loss(d3d11_device_ctx & dev, ggml_tensor * s0, ggml_tensor * s1, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "cross_entropy_loss", hlsl_cross_entropy_loss, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(s0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(s1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, bd.elem_offset, (uint32_t) s0->ne[0], (uint32_t) ggml_nrows(s0),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, 1);
 }
 
-static void ggml_d3d12_cross_entropy_loss_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, "cross_entropy_loss_back", hlsl_cross_entropy_loss_back, {});
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(dst->src[0]);
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(dst->src[1]);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(dst->src[2]);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_cross_entropy_loss_back(d3d11_device_ctx & dev, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, "cross_entropy_loss_back", hlsl_cross_entropy_loss_back, {});
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(dst->src[0]);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(dst->src[1]);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(dst->src[2]);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bg.elem_offset, b0.elem_offset, b1.elem_offset, bd.elem_offset, (uint32_t) dst->ne[0], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bg.va, b0.va, b1.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bg.va, b0.va, b1.va, bd.va }, n_rows);
 }
 
-static void ggml_d3d12_get_rows_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_get_rows_back(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
     ggml_tensor * ids = dst->src[1];
 
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "get_rows_back", hlsl_get_rows_back, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "get_rows_back", hlsl_get_rows_back, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(ids);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bi.elem_offset, bd.elem_offset,
         (uint32_t) dst->ne[0], n_rows, (uint32_t) ggml_nelements(ids),
         (uint32_t) (src->nb[1] / 4), (uint32_t) (dst->nb[1] / 4),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, n_rows);
 }
 
-static void ggml_d3d12_im2col_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_im2col_back(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];   // gradients of the im2col output
     ggml_tensor * src1 = dst->src[1];   // the convolution kernel, only its shape is used
 
@@ -2144,9 +2247,9 @@ static void ggml_d3d12_im2col_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
     const int32_t d1 = ggml_get_op_params_i32(dst, 5);
     const bool is_2D = ggml_get_op_params_i32(dst, 6) == 1;
 
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "im2col_back", hlsl_im2col_back, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "im2col_back", hlsl_im2col_back, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     // in the 1D case the CPU pins ioh to 0 and ignores s1/p1/d1, so neutral values give the same result
     const std::vector<uint32_t> params = {
@@ -2163,10 +2266,10 @@ static void ggml_d3d12_im2col_back(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) d0, (uint32_t) (is_2D ? d1 : 1),
         bs.elem_offset, bd.elem_offset, ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_lightning_indexer(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_lightning_indexer(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * q = dst->src[0];
     ggml_tensor * k = dst->src[1];
     ggml_tensor * w = dst->src[2];
@@ -2176,14 +2279,14 @@ static void ggml_d3d12_lightning_indexer(d3d12_device_ctx & dev, ggml_tensor * d
     if (k->type == GGML_TYPE_F16) {
         defines.push_back("K_F16");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, k->type == GGML_TYPE_F16 ? "lightning_indexer_f16" : "lightning_indexer",
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, k->type == GGML_TYPE_F16 ? "lightning_indexer_f16" : "lightning_indexer",
                                 hlsl_lightning_indexer, defines);
-    const d3d12_binding bq = ggml_d3d12_bind_tensor(q);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(k);
-    const d3d12_binding bw = ggml_d3d12_bind_tensor(w);
-    const d3d12_binding bm = ggml_d3d12_bind_tensor(m);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bq = ggml_d3d11_bind_tensor(q);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(k);
+    const d3d11_binding bw = ggml_d3d11_bind_tensor(w);
+    const d3d11_binding bm = ggml_d3d11_bind_tensor(m);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t   kts = ggml_type_size(k->type);
     const uint32_t ne  = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -2197,13 +2300,13 @@ static void ggml_d3d12_lightning_indexer(d3d12_device_ctx & dev, ggml_tensor * d
         (uint32_t) m->ne[3],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bq.va, bk.va, bw.va, bm.va, bd.va },
-                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bq.va, bk.va, bw.va, bm.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // RWKV_WKV6 / GATED_LINEAR_ATTN / RWKV_WKV7 all carry a per-sequence state through the tokens and
 // lay dst out as C*T outputs followed by that state, so they share these shape helpers.
-struct d3d12_wkv_shape {
+struct d3d11_wkv_shape {
     uint32_t cc;       // C
     uint32_t hs;       // head size
     uint32_t tps;      // tokens per sequence
@@ -2211,7 +2314,7 @@ struct d3d12_wkv_shape {
     uint32_t n_jobs;   // n_seqs * C
 };
 
-static d3d12_wkv_shape ggml_d3d12_wkv_shape(const ggml_tensor * dst, const ggml_tensor * state) {
+static d3d11_wkv_shape ggml_d3d11_wkv_shape(const ggml_tensor * dst, const ggml_tensor * state) {
     const uint32_t T      = (uint32_t) dst->src[1]->ne[2];
     const uint32_t cc     = (uint32_t) dst->ne[0];
     const uint32_t heads  = (uint32_t) dst->src[1]->ne[1];
@@ -2219,76 +2322,76 @@ static d3d12_wkv_shape ggml_d3d12_wkv_shape(const ggml_tensor * dst, const ggml_
     return { cc, cc / heads, T / n_seqs, cc * T, n_seqs * cc };
 }
 
-static void ggml_d3d12_rwkv_wkv6(d3d12_device_ctx & dev, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rwkv_wkv6", hlsl_rwkv_wkv6, {});
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[0]);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[1]);
-    const d3d12_binding br = ggml_d3d12_bind_tensor(dst->src[2]);
-    const d3d12_binding bf = ggml_d3d12_bind_tensor(dst->src[3]);
-    const d3d12_binding bt = ggml_d3d12_bind_tensor(dst->src[4]);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[5]);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
-    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[5]);
+static void ggml_d3d11_rwkv_wkv6(d3d11_device_ctx & dev, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "rwkv_wkv6", hlsl_rwkv_wkv6, {});
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(dst->src[0]);
+    const d3d11_binding bv = ggml_d3d11_bind_tensor(dst->src[1]);
+    const d3d11_binding br = ggml_d3d11_bind_tensor(dst->src[2]);
+    const d3d11_binding bf = ggml_d3d11_bind_tensor(dst->src[3]);
+    const d3d11_binding bt = ggml_d3d11_bind_tensor(dst->src[4]);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(dst->src[5]);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
+    const d3d11_wkv_shape sh = ggml_d3d11_wkv_shape(dst, dst->src[5]);
     const std::vector<uint32_t> params = {
         bk.elem_offset, bv.elem_offset, br.elem_offset, bf.elem_offset, bt.elem_offset,
         bs.elem_offset, bd.elem_offset,
         sh.cc, sh.hs, sh.tps, sh.s_off, sh.n_jobs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params,
+    ggml_d3d11_dispatch(dev, pipeline, params,
                         { bk.va, bv.va, br.va, bf.va, bt.va, bs.va, bd.va },
-                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_gated_linear_attn(d3d12_device_ctx & dev, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "gated_linear_attn", hlsl_gated_linear_attn, {});
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[0]);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[1]);
-    const d3d12_binding bq = ggml_d3d12_bind_tensor(dst->src[2]);
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(dst->src[3]);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[4]);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
-    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[4]);
+static void ggml_d3d11_gated_linear_attn(d3d11_device_ctx & dev, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "gated_linear_attn", hlsl_gated_linear_attn, {});
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(dst->src[0]);
+    const d3d11_binding bv = ggml_d3d11_bind_tensor(dst->src[1]);
+    const d3d11_binding bq = ggml_d3d11_bind_tensor(dst->src[2]);
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(dst->src[3]);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(dst->src[4]);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
+    const d3d11_wkv_shape sh = ggml_d3d11_wkv_shape(dst, dst->src[4]);
     const std::vector<uint32_t> params = {
         bk.elem_offset, bv.elem_offset, bq.elem_offset, bg.elem_offset, bs.elem_offset, bd.elem_offset,
         sh.cc, sh.hs, sh.tps, sh.s_off,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
         sh.n_jobs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bv.va, bq.va, bg.va, bs.va, bd.va },
-                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bv.va, bq.va, bg.va, bs.va, bd.va },
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_rwkv_wkv7(d3d12_device_ctx & dev, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "rwkv_wkv7", hlsl_rwkv_wkv7, {});
-    const d3d12_binding br = ggml_d3d12_bind_tensor(dst->src[0]);
-    const d3d12_binding bw = ggml_d3d12_bind_tensor(dst->src[1]);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(dst->src[2]);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(dst->src[3]);
-    const d3d12_binding ba = ggml_d3d12_bind_tensor(dst->src[4]);
-    const d3d12_binding bb = ggml_d3d12_bind_tensor(dst->src[5]);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(dst->src[6]);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
-    const d3d12_wkv_shape sh = ggml_d3d12_wkv_shape(dst, dst->src[6]);
+static void ggml_d3d11_rwkv_wkv7(d3d11_device_ctx & dev, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "rwkv_wkv7", hlsl_rwkv_wkv7, {});
+    const d3d11_binding br = ggml_d3d11_bind_tensor(dst->src[0]);
+    const d3d11_binding bw = ggml_d3d11_bind_tensor(dst->src[1]);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(dst->src[2]);
+    const d3d11_binding bv = ggml_d3d11_bind_tensor(dst->src[3]);
+    const d3d11_binding ba = ggml_d3d11_bind_tensor(dst->src[4]);
+    const d3d11_binding bb = ggml_d3d11_bind_tensor(dst->src[5]);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(dst->src[6]);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
+    const d3d11_wkv_shape sh = ggml_d3d11_wkv_shape(dst, dst->src[6]);
     const std::vector<uint32_t> params = {
         br.elem_offset, bw.elem_offset, bk.elem_offset, bv.elem_offset, ba.elem_offset,
         bb.elem_offset, bs.elem_offset, bd.elem_offset,
         sh.cc, sh.hs, sh.tps, sh.s_off, sh.n_jobs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params,
+    ggml_d3d11_dispatch(dev, pipeline, params,
                         { br.va, bw.va, bk.va, bv.va, ba.va, bb.va, bs.va, bd.va },
-                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D12_WG_SIZE));
+                        CEIL_DIV(sh.n_jobs, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_conv_2d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_conv_2d(d3d11_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (knl->type == GGML_TYPE_F16) {
         defines = { "KNL_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_f16" : "conv_2d", hlsl_conv_2d, defines);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_f16" : "conv_2d", hlsl_conv_2d, defines);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(knl);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const int32_t * op = (const int32_t *) dst->op_params;
     const uint32_t  ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -2301,19 +2404,19 @@ static void ggml_d3d12_conv_2d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_t
         (uint32_t) op[0], (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4], (uint32_t) op[5],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_conv_3d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_conv_3d(d3d11_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (knl->type == GGML_TYPE_F16) {
         defines = { "KNL_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_3d_f16" : "conv_3d", hlsl_conv_3d, defines);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_3d_f16" : "conv_3d", hlsl_conv_3d, defines);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(knl);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const int32_t * op = (const int32_t *) dst->op_params;
     const uint32_t  ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -2328,21 +2431,21 @@ static void ggml_d3d12_conv_3d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_t
         (uint32_t) op[5], (uint32_t) op[6], (uint32_t) op[7], (uint32_t) op[8],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_conv_transpose_2d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
+static void ggml_d3d11_conv_transpose_2d(d3d11_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
                                          ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (knl->type == GGML_TYPE_F16) {
         defines = { "KNL_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_transpose_2d_f16" : "conv_transpose_2d",
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_transpose_2d_f16" : "conv_transpose_2d",
                                 hlsl_conv_transpose_2d, defines);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(knl);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t   ts = ggml_type_size(knl->type);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -2356,13 +2459,13 @@ static void ggml_d3d12_conv_transpose_2d(d3d12_device_ctx & dev, ggml_tensor * k
         (uint32_t) ggml_get_op_params_i32(dst, 0),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_col2im_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "col2im_1d", hlsl_col2im_1d, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_col2im_1d(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "col2im_1d", hlsl_col2im_1d, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t k_oc = (uint32_t) src->ne[0];
     const uint32_t oc   = (uint32_t) ggml_get_op_params_i32(dst, 1);
     const uint32_t ne   = (uint32_t) ggml_nelements(dst);
@@ -2372,15 +2475,15 @@ static void ggml_d3d12_col2im_1d(d3d12_device_ctx & dev, ggml_tensor * src, ggml
         (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_conv_transpose_1d(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
+static void ggml_d3d11_conv_transpose_1d(d3d11_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src,
                                          ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "conv_transpose_1d", hlsl_conv_transpose_1d, {});
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "conv_transpose_1d", hlsl_conv_transpose_1d, {});
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(knl);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bk.elem_offset, bs.elem_offset, bd.elem_offset,
@@ -2390,20 +2493,20 @@ static void ggml_d3d12_conv_transpose_1d(d3d12_device_ctx & dev, ggml_tensor * k
         (uint32_t) dst->ne[0], (uint32_t) ggml_get_op_params_i32(dst, 0),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_conv_2d_dw(d3d12_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_conv_2d_dw(d3d11_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (knl->type == GGML_TYPE_F16) {
         defines = { "KNL_F16", "USE_16BIT" };
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
                                 hlsl_conv_2d_dw, defines);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(knl);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(knl);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const int32_t * opts   = (const int32_t *) dst->op_params;
     const uint32_t  ne     = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
@@ -2416,19 +2519,19 @@ static void ggml_d3d12_conv_2d_dw(d3d12_device_ctx & dev, ggml_tensor * knl, ggm
         (uint32_t) opts[3], (uint32_t) opts[4], (uint32_t) opts[5],
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bk.va, bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // WIN_PART / WIN_UNPART: index remap between an image and its window tiling
-static void ggml_d3d12_win_part(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool unpart) {
+static void ggml_d3d11_win_part(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, bool unpart) {
     std::vector<std::string> defines;
     if (unpart) {
         defines.push_back("UNPART");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, unpart ? "win_unpart" : "win_part", hlsl_win_part, defines);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, unpart ? "win_unpart" : "win_part", hlsl_win_part, defines);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     uint32_t w, windows_across;
     if (unpart) {
@@ -2446,47 +2549,47 @@ static void ggml_d3d12_win_part(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         ne, windows_across, w,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // GET_REL_POS: f16 relative position lookup
-static void ggml_d3d12_get_rel_pos(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, "get_rel_pos", hlsl_get_rel_pos, { "USE_16BIT" });
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_get_rel_pos(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, "get_rel_pos", hlsl_get_rel_pos, { "USE_16BIT" });
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) src->ne[0], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // ADD_REL_POS: both biases added in one gather, so no copy pass is needed
-static void ggml_d3d12_add_rel_pos(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_add_rel_pos(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                    ggml_tensor * src2, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "add_rel_pos", hlsl_add_rel_pos, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding b2 = ggml_d3d12_bind_tensor(src2);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "add_rel_pos", hlsl_add_rel_pos, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding b2 = ggml_d3d11_bind_tensor(src2);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, b2.elem_offset, bd.elem_offset,
         (uint32_t) src1->ne[0], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va },
-                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // SOLVE_TRI: forward substitution, one right-hand-side column per thread
-static void ggml_d3d12_solve_tri(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_solve_tri(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                  ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "solve_tri", hlsl_solve_tri, {});
-    const d3d12_binding ba = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding bb = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "solve_tri", hlsl_solve_tri, {});
+    const d3d11_binding ba = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding bb = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n      = (uint32_t) src0->ne[0];
     const uint32_t k      = (uint32_t) src1->ne[0];
     const uint32_t n_jobs = (uint32_t) (src0->ne[2] * src0->ne[3]) * k;
@@ -2497,17 +2600,17 @@ static void ggml_d3d12_solve_tri(d3d12_device_ctx & dev, ggml_tensor * src0, ggm
         (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         n, k, (uint32_t) src0->ne[2], n_jobs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { ba.va, bb.va, bd.va },
-                        CEIL_DIV(n_jobs, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { ba.va, bb.va, bd.va },
+                        CEIL_DIV(n_jobs, (uint32_t) D3D11_WG_SIZE));
 }
 
 // OUT_PROD: contraction over src0's second dimension, one destination element per thread
-static void ggml_d3d12_out_prod(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
+static void ggml_d3d11_out_prod(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
                                 ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "out_prod", hlsl_out_prod, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "out_prod", hlsl_out_prod, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, bd.elem_offset,
@@ -2520,12 +2623,12 @@ static void ggml_d3d12_out_prod(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
         (uint32_t) (dst->ne[2] / src0->ne[2]), (uint32_t) (dst->ne[3] / src0->ne[3]),
         ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va },
-                        CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va },
+                        CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // SSM_SCAN: one thread per (sequence, head, dim); the token loop stays inside the thread
-static void ggml_d3d12_ssm_scan(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_ssm_scan(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * s0  = dst->src[0];
     ggml_tensor * x   = dst->src[1];
     ggml_tensor * dt  = dst->src[2];
@@ -2534,15 +2637,15 @@ static void ggml_d3d12_ssm_scan(d3d12_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * C   = dst->src[5];
     ggml_tensor * ids = dst->src[6];
 
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "ssm_scan", hlsl_ssm_scan, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(s0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(x);
-    const d3d12_binding b2 = ggml_d3d12_bind_tensor(dt);
-    const d3d12_binding b3 = ggml_d3d12_bind_tensor(A);
-    const d3d12_binding b4 = ggml_d3d12_bind_tensor(B);
-    const d3d12_binding b5 = ggml_d3d12_bind_tensor(C);
-    const d3d12_binding b6 = ggml_d3d12_bind_tensor(ids);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "ssm_scan", hlsl_ssm_scan, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(s0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(x);
+    const d3d11_binding b2 = ggml_d3d11_bind_tensor(dt);
+    const d3d11_binding b3 = ggml_d3d11_bind_tensor(A);
+    const d3d11_binding b4 = ggml_d3d11_bind_tensor(B);
+    const d3d11_binding b5 = ggml_d3d11_bind_tensor(C);
+    const d3d11_binding b6 = ggml_d3d11_bind_tensor(ids);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
 
     const uint32_t nc = (uint32_t) s0->ne[0];
     const uint32_t nr = (uint32_t) s0->ne[1];
@@ -2566,18 +2669,18 @@ static void ggml_d3d12_ssm_scan(d3d12_device_ctx & dev, ggml_tensor * dst) {
         (uint32_t) (A->ne[0] == 1 ? 1 : 0),    // Mamba-2 has a scalar decay per head
         n_jobs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params,
+    ggml_d3d11_dispatch(dev, pipeline, params,
                         { b0.va, b1.va, b2.va, b3.va, b4.va, b5.va, b6.va, bd.va },
-                        CEIL_DIV(n_jobs, (uint32_t) D3D12_WG_SIZE));
+                        CEIL_DIV(n_jobs, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_add_id(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids,
+static void ggml_d3d11_add_id(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids,
                               ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "add_id", hlsl_add_id, {});
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(ids);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "add_id", hlsl_add_id, {});
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(ids);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const std::vector<uint32_t> params = {
         b0.elem_offset, b1.elem_offset, bi.elem_offset, bd.elem_offset,
@@ -2585,26 +2688,26 @@ static void ggml_d3d12_add_id(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_t
         (uint32_t) (ids->nb[1] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bi.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_norm(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "norm", hlsl_norm, {});
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+static void ggml_d3d11_norm(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "norm", hlsl_norm, {});
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = (uint32_t) ggml_nrows(dst);
     const std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, n_rows);
 }
 
 // RMS_NORM at node i followed by a MUL with a broadcastable f32 weight: one dispatch; returns nodes consumed
-static int ggml_d3d12_encode_rms_norm(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+static int ggml_d3d11_encode_rms_norm(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * norm = cgraph->nodes[i];
     if (!dev.no_fuse && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
         ggml_tensor * mul = cgraph->nodes[i + 1];
@@ -2615,15 +2718,15 @@ static int ggml_d3d12_encode_rms_norm(d3d12_device_ctx & dev, const ggml_cgraph 
             ok = ok && (w->ne[d] == 1 || w->ne[d] == norm->ne[d]);
         }
         if (ok) {
-            ggml_d3d12_rms_norm(dev, norm->src[0], norm, mul, w);
+            ggml_d3d11_rms_norm(dev, norm->src[0], norm, mul, w);
             return 2;
         }
     }
-    ggml_d3d12_rms_norm(dev, norm->src[0], norm, norm, nullptr);
+    ggml_d3d11_rms_norm(dev, norm->src[0], norm, norm, nullptr);
     return 1;
 }
 
-static void ggml_d3d12_soft_max(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2, ggml_tensor * dst) {
+static void ggml_d3d11_soft_max(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (src1) {
         defines.push_back("HAS_MASK");
@@ -2632,12 +2735,12 @@ static void ggml_d3d12_soft_max(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
     if (src2) {
         defines.push_back("HAS_SINK");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "soft_max", hlsl_soft_max, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "soft_max", hlsl_soft_max, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = src1 ? ggml_d3d12_bind_tensor(src1) : b0;
-    const d3d12_binding b2 = src2 ? ggml_d3d12_bind_tensor(src2) : b0;
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = src1 ? ggml_d3d11_bind_tensor(src1) : d3d11_binding{ 0, 0 };
+    const d3d11_binding b2 = src2 ? ggml_d3d11_bind_tensor(src2) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        t1 = src1 ? ggml_type_size(src1->type) : 4;
 
     const float max_bias    = ggml_get_op_params_f32(dst, 1);
@@ -2653,20 +2756,20 @@ static void ggml_d3d12_soft_max(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
         src1 ? (uint32_t) src1->ne[2] : 1u, src1 ? (uint32_t) src1->ne[3] : 1u,
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
-        ggml_d3d12_u32_from_f32(max_bias), ggml_d3d12_u32_from_f32(n_head_log2),
-        ggml_d3d12_u32_from_f32(m0), ggml_d3d12_u32_from_f32(m1),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+        ggml_d3d11_u32_from_f32(max_bias), ggml_d3d11_u32_from_f32(n_head_log2),
+        ggml_d3d11_u32_from_f32(m0), ggml_d3d11_u32_from_f32(m1),
         n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, n_rows);
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, n_rows);
 }
 
-static void ggml_d3d12_concat(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "concat", hlsl_concat, {});
+static void ggml_d3d11_concat(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "concat", hlsl_concat, {});
 
-    const d3d12_binding b0  = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1  = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd  = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0  = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1  = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd  = ggml_d3d11_bind_tensor(dst);
     const int32_t       dim = ggml_get_op_params_i32(dst, 0);
     const uint32_t      ne  = (uint32_t) ggml_nelements(dst);
 
@@ -2678,15 +2781,15 @@ static void ggml_d3d12_concat(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_t
         ne, (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         (uint32_t) dim, (uint32_t) src0->ne[dim],
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_ssm_conv(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "ssm_conv", hlsl_ssm_conv, {});
+static void ggml_d3d11_ssm_conv(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "ssm_conv", hlsl_ssm_conv, {});
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
 
     const std::vector<uint32_t> params = {
@@ -2695,11 +2798,11 @@ static void ggml_d3d12_ssm_conv(d3d12_device_ctx & dev, ggml_tensor * src0, ggml
         (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
         (uint32_t) src1->ne[0], (uint32_t) src0->ne[1], (uint32_t) dst->ne[1], ne,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 
-static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_flash_attn_ext(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * q     = dst->src[0];
     ggml_tensor * k     = dst->src[1];
     ggml_tensor * v     = dst->src[2];
@@ -2727,17 +2830,17 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
     if (logit_softcap != 0.0f) {
         defines.push_back("SOFTCAP");
     }
-    const d3d12_binding bq = ggml_d3d12_bind_tensor(q);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(k);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(v);
-    const d3d12_binding bm = mask ? ggml_d3d12_bind_tensor(mask) : bq;
-    const d3d12_binding bs = sinks ? ggml_d3d12_bind_tensor(sinks) : bq;
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bq = ggml_d3d11_bind_tensor(q);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(k);
+    const d3d11_binding bv = ggml_d3d11_bind_tensor(v);
+    const d3d11_binding bm = mask ? ggml_d3d11_bind_tensor(mask) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bs = sinks ? ggml_d3d11_bind_tensor(sinks) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        tk = ggml_type_size(k->type);
     const size_t        tv = ggml_type_size(v->type);
 
     // f16 rows start on 4-byte boundaries when the element offset and every stride are even
-    auto f16_aligned = [](const d3d12_binding & b, const ggml_tensor * t) {
+    auto f16_aligned = [](const d3d11_binding & b, const ggml_tensor * t) {
         return b.elem_offset % 2 == 0 && (t->nb[1] / 2) % 2 == 0 && (t->nb[2] / 2) % 2 == 0 && (t->nb[3] / 2) % 2 == 0;
     };
     if (k->type == GGML_TYPE_F16 && f16_aligned(bk, k)) {
@@ -2746,7 +2849,7 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
     if (v->type == GGML_TYPE_F16 && f16_aligned(bv, v)) {
         defines.push_back("V_ALIGNED");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "flash_attn", hlsl_flash_attn, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "flash_attn", hlsl_flash_attn, defines);
 
     const uint32_t n_head      = (uint32_t) q->ne[2];
     const float    n_head_log2 = (float) (1u << (uint32_t) floor(log2((double) n_head)));
@@ -2763,43 +2866,43 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
         (uint32_t) q->ne[1], n_head, (uint32_t) k->ne[1],
         (uint32_t) (q->ne[2] / k->ne[2]), (uint32_t) (q->ne[3] / k->ne[3]),
         (uint32_t) (q->ne[2] / v->ne[2]), (uint32_t) (q->ne[3] / v->ne[3]),
-        ggml_d3d12_u32_from_f32(scale), ggml_d3d12_u32_from_f32(max_bias), ggml_d3d12_u32_from_f32(logit_softcap),
-        ggml_d3d12_u32_from_f32(n_head_log2), ggml_d3d12_u32_from_f32(m0), ggml_d3d12_u32_from_f32(m1),
-        D3D12_FLASH_ATTN_BLK, 0, 0, 0,   // blk_size, n_blocks, row0, n_rows
+        ggml_d3d11_u32_from_f32(scale), ggml_d3d11_u32_from_f32(max_bias), ggml_d3d11_u32_from_f32(logit_softcap),
+        ggml_d3d11_u32_from_f32(n_head_log2), ggml_d3d11_u32_from_f32(m0), ggml_d3d11_u32_from_f32(m1),
+        D3D11_FLASH_ATTN_BLK, 0, 0, 0,   // blk_size, n_blocks, row0, n_rows
     };
     const size_t row0_idx = params.size() - 2;
 
     const uint32_t n_kv     = (uint32_t) k->ne[1];
-    const uint32_t n_blocks = CEIL_DIV(n_kv, (uint32_t) D3D12_FLASH_ATTN_BLK);
+    const uint32_t n_blocks = CEIL_DIV(n_kv, (uint32_t) D3D11_FLASH_ATTN_BLK);
     params[row0_idx - 1]    = n_blocks;
 
     const uint64_t n_rows    = (uint64_t) ggml_nrows(dst);   // dst is [DV, n_head, n_q, n_batch]
     const uint64_t row_work  = std::max<uint64_t>(1, (uint64_t) n_kv * (uint64_t) (k->ne[0] + v->ne[0]));
     const uint64_t row_bytes = (uint64_t) n_blocks * (uint64_t) (v->ne[0] + 1) * sizeof(float);
-    const uint64_t tmp_rows  = std::max<uint64_t>(1, D3D12_FLASH_ATTN_TMP_MAX / row_bytes);
+    const uint64_t tmp_rows  = std::max<uint64_t>(1, D3D11_FLASH_ATTN_TMP_MAX / row_bytes);
     const bool     big       = n_rows * row_work > dev.fa_work;
 
     const size_t tmp_need = (size_t) (std::min(tmp_rows, n_rows) * row_bytes);
     if (dev.fa_tmp_size < tmp_need) {
         // the old buffer may still be referenced by recorded dispatches: run them before releasing it
         if (dev.dispatches_in_list > 0) {
-            ggml_d3d12_submit_and_wait(dev);
-            ggml_d3d12_begin(dev, true);
+            ggml_d3d11_submit_and_wait(dev);
+            ggml_d3d11_begin(dev, true);
         }
         size_t size = 1ull << 20;
         while (size < tmp_need) {
             size *= 2;
         }
-        dev.fa_tmp      = ggml_d3d12_create_buffer(dev, size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12_fa_tmp");
+        dev.fa_tmp      = ggml_d3d11_create_buffer(dev, size, D3D11_HEAP_TYPE_DEFAULT, L"ggml_d3d11_fa_tmp");
         dev.fa_tmp_size = size;
     }
-    const D3D12_GPU_VIRTUAL_ADDRESS tmp_va = dev.fa_tmp->GetGPUVirtualAddress();
+    const D3D11_GPU_VIRTUAL_ADDRESS tmp_va = dev.fa_tmp->GetGPUVirtualAddress();
 
     std::vector<std::string> combine_defines = { "DV=" + std::to_string(v->ne[0]), "COMBINE" };
     if (sinks) {
         combine_defines.push_back("HAS_SINKS");
     }
-    d3d12_pipeline & combine = ggml_d3d12_get_pipeline(dev, "flash_attn", hlsl_flash_attn, combine_defines);
+    d3d11_pipeline & combine = ggml_d3d11_get_pipeline(dev, "flash_attn", hlsl_flash_attn, combine_defines);
 
     for (uint64_t row0 = 0, n = 0; row0 < n_rows; row0 += n) {
         n = std::min(n_rows - row0, std::max<uint64_t>(1, std::min(dev.fa_work / row_work, tmp_rows)));
@@ -2809,25 +2912,25 @@ static void ggml_d3d12_flash_attn_ext(d3d12_device_ctx & dev, ggml_tensor * dst)
             // one bounded chunk per command list; the budget follows the submit time of the previous chunk
             // (target 15..60 ms, far below the Windows GPU timeout, short enough to keep the desktop responsive)
             dev.n_flush_batch++;
-            const double t0 = ggml_d3d12_time_us();
-            ggml_d3d12_submit_and_wait(dev);
-            const double ms = (ggml_d3d12_time_us() - t0) / 1000.0;
-            if (row0 > 0) {
+            const double t0 = ggml_d3d11_time_us();
+            ggml_d3d11_submit_and_wait(dev);
+            const double ms = (ggml_d3d11_time_us() - t0) / 1000.0;
+            if (row0 > 0 && !dev.fa_work_fixed) {
                 if (ms < 15.0) {
                     dev.fa_work = std::min<uint64_t>(dev.fa_work * 2, 1ull << 34);
                 } else if (ms > 60.0) {
                     dev.fa_work = std::max<uint64_t>(dev.fa_work / 2, 1ull << 20);
                 }
             }
-            ggml_d3d12_begin(dev, true);
+            ggml_d3d11_begin(dev, true);
         }
-        const std::vector<D3D12_GPU_VIRTUAL_ADDRESS> uavs = { bq.va, bk.va, bv.va, bm.va, bs.va, bd.va, tmp_va };
-        ggml_d3d12_dispatch(dev, pipeline, params, uavs, CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D12_WG_SIZE));
-        ggml_d3d12_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n, (uint32_t) D3D12_WG_SIZE));
+        const std::vector<D3D11_GPU_VIRTUAL_ADDRESS> uavs = { bq.va, bk.va, bv.va, bm.va, bs.va, bd.va, tmp_va };
+        ggml_d3d11_dispatch(dev, pipeline, params, uavs, CEIL_DIV((uint32_t) n * n_blocks, (uint32_t) D3D11_WG_SIZE));
+        ggml_d3d11_dispatch(dev, combine, params, uavs, CEIL_DIV((uint32_t) n, (uint32_t) D3D11_WG_SIZE));
     }
 }
 
-static void ggml_d3d12_gated_delta_net(d3d12_device_ctx & dev, ggml_tensor * dst) {
+static void ggml_d3d11_gated_delta_net(d3d11_device_ctx & dev, ggml_tensor * dst) {
     ggml_tensor * q = dst->src[0];
     ggml_tensor * k = dst->src[1];
     ggml_tensor * v = dst->src[2];
@@ -2845,15 +2948,15 @@ static void ggml_d3d12_gated_delta_net(d3d12_device_ctx & dev, ggml_tensor * dst
     if (g->ne[0] == S_v) {
         defines.push_back("KDA");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "gated_delta_net", hlsl_gated_delta_net, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "gated_delta_net", hlsl_gated_delta_net, defines);
 
-    const d3d12_binding bq = ggml_d3d12_bind_tensor(q);
-    const d3d12_binding bk = ggml_d3d12_bind_tensor(k);
-    const d3d12_binding bv = ggml_d3d12_bind_tensor(v);
-    const d3d12_binding bg = ggml_d3d12_bind_tensor(g);
-    const d3d12_binding bb = ggml_d3d12_bind_tensor(b);
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(s);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bq = ggml_d3d11_bind_tensor(q);
+    const d3d11_binding bk = ggml_d3d11_bind_tensor(k);
+    const d3d11_binding bv = ggml_d3d11_bind_tensor(v);
+    const d3d11_binding bg = ggml_d3d11_bind_tensor(g);
+    const d3d11_binding bb = ggml_d3d11_bind_tensor(b);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(s);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const uint32_t n_rows  = n_seqs * H * S_v;
 
     std::vector<uint32_t> params = {
@@ -2867,45 +2970,45 @@ static void ggml_d3d12_gated_delta_net(d3d12_device_ctx & dev, ggml_tensor * dst
         (uint32_t) (v->ne[3] / q->ne[3]), (uint32_t) (v->ne[3] / k->ne[3]),
         (uint32_t) (s->nb[3] / 4), K,
         0, 0,   // t0, t1
-        n_rows, ggml_d3d12_u32_from_f32(1.0f / sqrtf((float) S_v)),
+        n_rows, ggml_d3d11_u32_from_f32(1.0f / sqrtf((float) S_v)),
     };
     const size_t t0_idx = 30;
 
     // with one snapshot the state carries over between token ranges, so long prompts are split to bound the
     // work per command list (same budget as flash attention)
     const uint64_t tok_work = std::max<uint64_t>(1, (uint64_t) n_rows * 3 * S_v);
-    const uint32_t chunk    = K == 1 ? (uint32_t) std::max<uint64_t>(1, D3D12_FLASH_ATTN_WORK / tok_work) : n_tokens;
-    const bool     big      = (uint64_t) n_tokens * tok_work > D3D12_FLASH_ATTN_WORK;
+    const uint32_t chunk    = K == 1 ? (uint32_t) std::max<uint64_t>(1, D3D11_FLASH_ATTN_WORK / tok_work) : n_tokens;
+    const bool     big      = (uint64_t) n_tokens * tok_work > D3D11_FLASH_ATTN_WORK;
     for (uint32_t t0 = 0; t0 < n_tokens; t0 += chunk) {
         params[t0_idx]     = t0;
         params[t0_idx + 1] = std::min(n_tokens, t0 + chunk);
         if (big && dev.dispatches_in_list > 0) {
             dev.n_flush_batch++;
-            ggml_d3d12_submit_and_wait(dev);
-            ggml_d3d12_begin(dev, true);
+            ggml_d3d11_submit_and_wait(dev);
+            ggml_d3d11_begin(dev, true);
         }
-        ggml_d3d12_dispatch(dev, pipeline, params, { bq.va, bk.va, bv.va, bg.va, bb.va, bs.va, bd.va },
-                            CEIL_DIV(n_rows, (uint32_t) D3D12_WG_SIZE));
+        ggml_d3d11_dispatch(dev, pipeline, params, { bq.va, bk.va, bv.va, bg.va, bb.va, bs.va, bd.va },
+                            CEIL_DIV(n_rows, (uint32_t) D3D11_WG_SIZE));
     }
 }
 
-static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2,
+static void ggml_d3d11_rope(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * src2,
                             ggml_tensor * dst, bool backward = false) {
     std::vector<std::string> defines;
-    ggml_d3d12_float_type_define(dst->type, defines);
+    ggml_d3d11_float_type_define(dst->type, defines);
     if (src2) {
         defines.push_back("FF_FUNC");
     }
     if (backward) {
         defines.push_back("BACKWARD");
     }
-    d3d12_pipeline & pipeline =
-        ggml_d3d12_get_pipeline(dev, backward ? "rope_back" : "rope", hlsl_rope, defines);
+    d3d11_pipeline & pipeline =
+        ggml_d3d11_get_pipeline(dev, backward ? "rope_back" : "rope", hlsl_rope, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = ggml_d3d12_bind_tensor(src1);
-    const d3d12_binding b2 = src2 ? ggml_d3d12_bind_tensor(src2) : b0;
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = ggml_d3d11_bind_tensor(src1);
+    const d3d11_binding b2 = src2 ? ggml_d3d11_bind_tensor(src2) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src0->type);
 
     const int n_dims     = ((int32_t *) dst->op_params)[1];
@@ -2932,27 +3035,27 @@ static void ggml_d3d12_rope(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_ten
         (uint32_t) (dst->nb[1] / ts), (uint32_t) (dst->nb[2] / ts), (uint32_t) (dst->nb[3] / ts),
         n_threads, (uint32_t) src0->ne[0], (uint32_t) src0->ne[1], (uint32_t) src0->ne[2],
         (uint32_t) n_dims, (uint32_t) mode,
-        ggml_d3d12_u32_from_f32(theta_scale), ggml_d3d12_u32_from_f32(attn_factor),
-        ggml_d3d12_u32_from_f32(freq_scale), ggml_d3d12_u32_from_f32(ext_factor),
-        ggml_d3d12_u32_from_f32(corr_dims[0]), ggml_d3d12_u32_from_f32(corr_dims[1]),
+        ggml_d3d11_u32_from_f32(theta_scale), ggml_d3d11_u32_from_f32(attn_factor),
+        ggml_d3d11_u32_from_f32(freq_scale), ggml_d3d11_u32_from_f32(ext_factor),
+        ggml_d3d11_u32_from_f32(corr_dims[0]), ggml_d3d11_u32_from_f32(corr_dims[1]),
         (uint32_t) sections[0], (uint32_t) sections[1], (uint32_t) sections[2], (uint32_t) sections[3],
         (uint32_t) n_offs,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, CEIL_DIV(n_threads, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, b2.va, bd.va }, CEIL_DIV(n_threads, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_glu(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_d3d11_glu(d3d11_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
     std::vector<std::string> defines;
-    ggml_d3d12_float_type_define(dst->type, defines);
+    ggml_d3d11_float_type_define(dst->type, defines);
     defines.push_back(std::string("OP_") + ggml_glu_op_name(ggml_get_glu_op(dst)));
     if (!src1) {
         defines.push_back("NO_SPLIT");
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "glu", hlsl_glu, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "glu", hlsl_glu, defines);
 
-    const d3d12_binding b0 = ggml_d3d12_bind_tensor(src0);
-    const d3d12_binding b1 = src1 ? ggml_d3d12_bind_tensor(src1) : b0;
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding b0 = ggml_d3d11_bind_tensor(src0);
+    const d3d11_binding b1 = src1 ? ggml_d3d11_bind_tensor(src1) : d3d11_binding{ 0, 0 };
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(dst->type);
     const ggml_tensor * s1 = src1 ? src1 : src0;
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
@@ -2964,20 +3067,20 @@ static void ggml_d3d12_glu(d3d12_device_ctx & dev, ggml_tensor * src0, ggml_tens
         (uint32_t) (dst->nb[1] / ts), (uint32_t) (dst->nb[2] / ts), (uint32_t) (dst->nb[3] / ts),
         ne, (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         (uint32_t) ((int32_t *) dst->op_params)[1],
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 2)),
-        ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 3)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 2)),
+        ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 3)),
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { b0.va, b1.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_unary(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+static void ggml_d3d11_unary(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
-    ggml_d3d12_float_type_define(dst->type, defines);
+    ggml_d3d11_float_type_define(dst->type, defines);
     defines.push_back(dst->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(dst)) : ggml_op_name(dst->op));
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "unary", hlsl_unary, defines);
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "unary", hlsl_unary, defines);
 
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const uint32_t      ne = (uint32_t) ggml_nelements(dst);
     const bool          clamp = dst->op == GGML_OP_CLAMP;
@@ -2986,25 +3089,25 @@ static void ggml_d3d12_unary(d3d12_device_ctx & dev, ggml_tensor * src, ggml_ten
         ne, bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
-        clamp ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 0)) : 0u,
-        clamp ? ggml_d3d12_u32_from_f32(ggml_get_op_params_f32(dst, 1)) : 0u,
+        clamp ? ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 0)) : 0u,
+        clamp ? ggml_d3d11_u32_from_f32(ggml_get_op_params_f32(dst, 1)) : 0u,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bd.va }, CEIL_DIV(ne, (uint32_t) D3D11_WG_SIZE));
 }
 
 // GET_ROWS of a quantized source: the dequant paths of the matrix-vector kernel, TPR threads per row
-static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+static void ggml_d3d11_get_rows_quant(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
     const uint32_t tpr = std::min<uint32_t>(32, dev.mm_tpr_max);
     std::string    define = "SRC0_";
     define += ggml_type_name(src->type);
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "get_rows_q", hlsl_get_rows_q,
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "get_rows_q", hlsl_get_rows_q,
                                                         { define, "TPR=" + std::to_string(tpr) });
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(idx);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        td = ggml_type_size(dst->type);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
@@ -3016,12 +3119,12 @@ static void ggml_d3d12_get_rows_quant(d3d12_device_ctx & dev, ggml_tensor * src,
         (uint32_t) (dst->nb[1] / td), (uint32_t) (dst->nb[2] / td), (uint32_t) (dst->nb[3] / td),
         (uint32_t) dst->ne[0], (uint32_t) idx->ne[0], (uint32_t) idx->ne[1], n_rows,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_rows * tpr, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_rows * tpr, (uint32_t) D3D11_WG_SIZE));
 }
 
-static void ggml_d3d12_get_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+static void ggml_d3d11_get_rows(d3d11_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
     if (ggml_is_quantized(src->type)) {
-        ggml_d3d12_get_rows_quant(dev, src, idx, dst);
+        ggml_d3d11_get_rows_quant(dev, src, idx, dst);
         return;
     }
     std::string define = "SRC_";
@@ -3029,11 +3132,11 @@ static void ggml_d3d12_get_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
     for (auto & ch : define) {
         ch = (char) toupper((unsigned char) ch);
     }
-    d3d12_pipeline & pipeline = ggml_d3d12_get_pipeline(dev, "get_rows", hlsl_get_rows, { define });
+    d3d11_pipeline & pipeline = ggml_d3d11_get_pipeline(dev, "get_rows", hlsl_get_rows, { define });
 
-    const d3d12_binding bs = ggml_d3d12_bind_tensor(src);
-    const d3d12_binding bi = ggml_d3d12_bind_tensor(idx);
-    const d3d12_binding bd = ggml_d3d12_bind_tensor(dst);
+    const d3d11_binding bs = ggml_d3d11_bind_tensor(src);
+    const d3d11_binding bi = ggml_d3d11_bind_tensor(idx);
+    const d3d11_binding bd = ggml_d3d11_bind_tensor(dst);
     const size_t        ts = ggml_type_size(src->type);
     const size_t        td = ggml_type_size(dst->type);
     const bool          quant   = ggml_is_quantized(src->type);
@@ -3046,10 +3149,10 @@ static void ggml_d3d12_get_rows(d3d12_device_ctx & dev, ggml_tensor * src, ggml_
         (uint32_t) (dst->nb[1] / td), (uint32_t) (dst->nb[2] / td), (uint32_t) (dst->nb[3] / td),
         (uint32_t) dst->ne[0], (uint32_t) idx->ne[0], (uint32_t) idx->ne[1], n_units,
     };
-    ggml_d3d12_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_units, (uint32_t) D3D12_WG_SIZE));
+    ggml_d3d11_dispatch(dev, pipeline, params, { bs.va, bi.va, bd.va }, CEIL_DIV(n_units, (uint32_t) D3D11_WG_SIZE));
 }
 
-static bool ggml_d3d12_unary_supported(ggml_unary_op op) {
+static bool ggml_d3d11_unary_supported(ggml_unary_op op) {
     switch (op) {
         case GGML_UNARY_OP_ABS: case GGML_UNARY_OP_SGN: case GGML_UNARY_OP_NEG: case GGML_UNARY_OP_STEP:
         case GGML_UNARY_OP_TANH: case GGML_UNARY_OP_ELU: case GGML_UNARY_OP_RELU: case GGML_UNARY_OP_SIGMOID:
@@ -3063,24 +3166,35 @@ static bool ggml_d3d12_unary_supported(ggml_unary_op op) {
     }
 }
 
-static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node);
+static void ggml_d3d11_encode_node(d3d11_device_ctx & dev, ggml_tensor * node);
 
 // encodes the node at index i, fused with following nodes when possible; returns the number of nodes consumed
-static int ggml_d3d12_encode_nodes(d3d12_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+static int ggml_d3d11_encode_nodes_inner(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i);
+
+static int ggml_d3d11_encode_nodes(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+    for (int k = 0; k < 8; k++) {
+        dev.out_nodes[k] = i + k < cgraph->n_nodes ? cgraph->nodes[i + k] : nullptr;
+    }
+    const int n = ggml_d3d11_encode_nodes_inner(dev, cgraph, i);
+    std::fill(std::begin(dev.out_nodes), std::end(dev.out_nodes), nullptr);
+    return n;
+}
+
+static int ggml_d3d11_encode_nodes_inner(d3d11_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
     if (!ggml_is_empty(node)) {
         if (node->op == GGML_OP_MUL_MAT) {
-            return ggml_d3d12_encode_mul_mat_group(dev, cgraph, i);
+            return ggml_d3d11_encode_mul_mat_group(dev, cgraph, i);
         }
         if (node->op == GGML_OP_RMS_NORM) {
-            return ggml_d3d12_encode_rms_norm(dev, cgraph, i);
+            return ggml_d3d11_encode_rms_norm(dev, cgraph, i);
         }
     }
-    ggml_d3d12_encode_node(dev, node);
+    ggml_d3d11_encode_node(dev, node);
     return 1;
 }
 
-static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
+static void ggml_d3d11_encode_node(d3d11_device_ctx & dev, ggml_tensor * node) {
     if (ggml_is_empty(node)) {
         return;
     }
@@ -3094,236 +3208,236 @@ static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
-            ggml_d3d12_cpy(dev, node->src[0], node);
+            ggml_d3d11_cpy(dev, node->src[0], node);
             return;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-            ggml_d3d12_binary_op(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_binary_op(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_SCALE:
-            ggml_d3d12_scale(dev, node->src[0], node);
+            ggml_d3d11_scale(dev, node->src[0], node);
             return;
         case GGML_OP_SET_ROWS:
-            ggml_d3d12_set_rows(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_set_rows(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_MUL_MAT:
-            ggml_d3d12_mul_mat(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_mul_mat(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_MUL_MAT_ID:
-            ggml_d3d12_mul_mat_id(dev, node->src[0], node->src[1], node->src[2], node);
+            ggml_d3d11_mul_mat_id(dev, node->src[0], node->src[1], node->src[2], node);
             return;
         case GGML_OP_RMS_NORM:
-            ggml_d3d12_rms_norm(dev, node->src[0], node, node, nullptr);
+            ggml_d3d11_rms_norm(dev, node->src[0], node, node, nullptr);
             return;
         case GGML_OP_SOFT_MAX:
-            ggml_d3d12_soft_max(dev, node->src[0], node->src[1], node->src[2], node);
+            ggml_d3d11_soft_max(dev, node->src[0], node->src[1], node->src[2], node);
             return;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_d3d12_flash_attn_ext(dev, node);
+            ggml_d3d11_flash_attn_ext(dev, node);
             return;
         case GGML_OP_CONCAT:
-            ggml_d3d12_concat(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_concat(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_NORM:
-            ggml_d3d12_norm(dev, node->src[0], node);
+            ggml_d3d11_norm(dev, node->src[0], node);
             return;
         case GGML_OP_L2_NORM:
-            ggml_d3d12_rms_norm(dev, node->src[0], node, node, nullptr);
+            ggml_d3d11_rms_norm(dev, node->src[0], node, node, nullptr);
             return;
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
-            ggml_d3d12_argsort(dev, node->src[0], node);
+            ggml_d3d11_argsort(dev, node->src[0], node);
             return;
         case GGML_OP_REPEAT:
-            ggml_d3d12_repeat(dev, node->src[0], node);
+            ggml_d3d11_repeat(dev, node->src[0], node);
             return;
         case GGML_OP_IM2COL:
-            ggml_d3d12_im2col(dev, node);
+            ggml_d3d11_im2col(dev, node);
             return;
         case GGML_OP_UPSCALE:
-            ggml_d3d12_upscale(dev, node->src[0], node);
+            ggml_d3d11_upscale(dev, node->src[0], node);
             return;
         case GGML_OP_POOL_2D:
-            ggml_d3d12_pool_2d(dev, node->src[0], node);
+            ggml_d3d11_pool_2d(dev, node->src[0], node);
             return;
         case GGML_OP_FILL:
-            ggml_d3d12_fill(dev, node);
+            ggml_d3d11_fill(dev, node);
             return;
         case GGML_OP_SUM_ROWS:
-            ggml_d3d12_sum_rows(dev, node->src[0], node);
+            ggml_d3d11_sum_rows(dev, node->src[0], node);
             return;
         case GGML_OP_MEAN:
-            ggml_d3d12_sum_rows(dev, node->src[0], node, true);
+            ggml_d3d11_sum_rows(dev, node->src[0], node, true);
             return;
         case GGML_OP_SUM:
-            ggml_d3d12_sum(dev, node->src[0], node);
+            ggml_d3d11_sum(dev, node->src[0], node);
             return;
         case GGML_OP_ARGMAX:
-            ggml_d3d12_argmax(dev, node->src[0], node);
+            ggml_d3d11_argmax(dev, node->src[0], node);
             return;
         case GGML_OP_ARANGE:
-            ggml_d3d12_arange(dev, node);
+            ggml_d3d11_arange(dev, node);
             return;
         case GGML_OP_DIAG_MASK_INF:
-            ggml_d3d12_diag_mask(dev, node->src[0], node, -INFINITY);
+            ggml_d3d11_diag_mask(dev, node->src[0], node, -INFINITY);
             return;
         case GGML_OP_DIAG_MASK_ZERO:
-            ggml_d3d12_diag_mask(dev, node->src[0], node, 0.0f);
+            ggml_d3d11_diag_mask(dev, node->src[0], node, 0.0f);
             return;
         case GGML_OP_ROLL:
-            ggml_d3d12_roll(dev, node->src[0], node);
+            ggml_d3d11_roll(dev, node->src[0], node);
             return;
         case GGML_OP_PAD:
-            ggml_d3d12_pad(dev, node->src[0], node);
+            ggml_d3d11_pad(dev, node->src[0], node);
             return;
         case GGML_OP_PAD_REFLECT_1D:
-            ggml_d3d12_pad_reflect_1d(dev, node->src[0], node);
+            ggml_d3d11_pad_reflect_1d(dev, node->src[0], node);
             return;
         case GGML_OP_TIMESTEP_EMBEDDING:
-            ggml_d3d12_timestep_embedding(dev, node->src[0], node);
+            ggml_d3d11_timestep_embedding(dev, node->src[0], node);
             return;
         case GGML_OP_SET:
-            ggml_d3d12_set_acc(dev, node->src[0], node->src[1], node, false);
+            ggml_d3d11_set_acc(dev, node->src[0], node->src[1], node, false);
             return;
         case GGML_OP_ACC:
-            ggml_d3d12_set_acc(dev, node->src[0], node->src[1], node, true);
+            ggml_d3d11_set_acc(dev, node->src[0], node->src[1], node, true);
             return;
         case GGML_OP_CUMSUM:
-            ggml_d3d12_cumsum(dev, node->src[0], node);
+            ggml_d3d11_cumsum(dev, node->src[0], node);
             return;
         case GGML_OP_TRI:
-            ggml_d3d12_tri(dev, node->src[0], node);
+            ggml_d3d11_tri(dev, node->src[0], node);
             return;
         case GGML_OP_COUNT_EQUAL:
-            ggml_d3d12_count_equal(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_count_equal(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_ADD1:
-            ggml_d3d12_add1(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_add1(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_LEAKY_RELU:
-            ggml_d3d12_leaky_relu(dev, node->src[0], node);
+            ggml_d3d11_leaky_relu(dev, node->src[0], node);
             return;
         case GGML_OP_GROUP_NORM:
-            ggml_d3d12_group_norm(dev, node->src[0], node);
+            ggml_d3d11_group_norm(dev, node->src[0], node);
             return;
         case GGML_OP_DIAG:
-            ggml_d3d12_diag(dev, node->src[0], node);
+            ggml_d3d11_diag(dev, node->src[0], node);
             return;
         case GGML_OP_POOL_1D:
-            ggml_d3d12_pool_1d(dev, node->src[0], node);
+            ggml_d3d11_pool_1d(dev, node->src[0], node);
             return;
         case GGML_OP_WIN_PART:
-            ggml_d3d12_win_part(dev, node->src[0], node, false);
+            ggml_d3d11_win_part(dev, node->src[0], node, false);
             return;
         case GGML_OP_WIN_UNPART:
-            ggml_d3d12_win_part(dev, node->src[0], node, true);
+            ggml_d3d11_win_part(dev, node->src[0], node, true);
             return;
         case GGML_OP_GET_REL_POS:
-            ggml_d3d12_get_rel_pos(dev, node->src[0], node);
+            ggml_d3d11_get_rel_pos(dev, node->src[0], node);
             return;
         case GGML_OP_ADD_REL_POS:
-            ggml_d3d12_add_rel_pos(dev, node->src[0], node->src[1], node->src[2], node);
+            ggml_d3d11_add_rel_pos(dev, node->src[0], node->src[1], node->src[2], node);
             return;
         case GGML_OP_SOLVE_TRI:
-            ggml_d3d12_solve_tri(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_solve_tri(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_OUT_PROD:
-            ggml_d3d12_out_prod(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_out_prod(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_ADD_ID:
-            ggml_d3d12_add_id(dev, node->src[0], node->src[1], node->src[2], node);
+            ggml_d3d11_add_id(dev, node->src[0], node->src[1], node->src[2], node);
             return;
         case GGML_OP_GATED_DELTA_NET:
-            ggml_d3d12_gated_delta_net(dev, node);
+            ggml_d3d11_gated_delta_net(dev, node);
             return;
         case GGML_OP_SSM_CONV:
-            ggml_d3d12_ssm_conv(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_ssm_conv(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_SSM_SCAN:
-            ggml_d3d12_ssm_scan(dev, node);
+            ggml_d3d11_ssm_scan(dev, node);
             return;
         case GGML_OP_CONV_2D_DW:
-            ggml_d3d12_conv_2d_dw(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_conv_2d_dw(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_CONV_TRANSPOSE_1D:
-            ggml_d3d12_conv_transpose_1d(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_conv_transpose_1d(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_COL2IM_1D:
-            ggml_d3d12_col2im_1d(dev, node->src[0], node);
+            ggml_d3d11_col2im_1d(dev, node->src[0], node);
             return;
         case GGML_OP_IM2COL_3D:
-            ggml_d3d12_im2col_3d(dev, node);
+            ggml_d3d11_im2col_3d(dev, node);
             return;
         case GGML_OP_CONV_TRANSPOSE_2D:
-            ggml_d3d12_conv_transpose_2d(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_conv_transpose_2d(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_CONV_2D:
-            ggml_d3d12_conv_2d(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_conv_2d(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_CONV_3D:
-            ggml_d3d12_conv_3d(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_conv_3d(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_LIGHTNING_INDEXER:
-            ggml_d3d12_lightning_indexer(dev, node);
+            ggml_d3d11_lightning_indexer(dev, node);
             return;
         case GGML_OP_DSV4_HC_PRE:
-            ggml_d3d12_dsv4_hc_pre(dev, node);
+            ggml_d3d11_dsv4_hc_pre(dev, node);
             return;
         case GGML_OP_DSV4_HC_POST:
-            ggml_d3d12_dsv4_hc_post(dev, node);
+            ggml_d3d11_dsv4_hc_post(dev, node);
             return;
         case GGML_OP_DSV4_HC_COMB:
-            ggml_d3d12_dsv4_hc_comb(dev, node);
+            ggml_d3d11_dsv4_hc_comb(dev, node);
             return;
         case GGML_OP_RWKV_WKV6:
-            ggml_d3d12_rwkv_wkv6(dev, node);
+            ggml_d3d11_rwkv_wkv6(dev, node);
             return;
         case GGML_OP_GATED_LINEAR_ATTN:
-            ggml_d3d12_gated_linear_attn(dev, node);
+            ggml_d3d11_gated_linear_attn(dev, node);
             return;
         case GGML_OP_RWKV_WKV7:
-            ggml_d3d12_rwkv_wkv7(dev, node);
+            ggml_d3d11_rwkv_wkv7(dev, node);
             return;
         case GGML_OP_ROPE:
-            ggml_d3d12_rope(dev, node->src[0], node->src[1], node->src[2], node);
+            ggml_d3d11_rope(dev, node->src[0], node->src[1], node->src[2], node);
             return;
         case GGML_OP_ROPE_BACK:
-            ggml_d3d12_rope(dev, node->src[0], node->src[1], node->src[2], node, true);
+            ggml_d3d11_rope(dev, node->src[0], node->src[1], node->src[2], node, true);
             return;
         case GGML_OP_OPT_STEP_SGD:
-            ggml_d3d12_opt_step(dev, node, false);
+            ggml_d3d11_opt_step(dev, node, false);
             return;
         case GGML_OP_OPT_STEP_ADAMW:
-            ggml_d3d12_opt_step(dev, node, true);
+            ggml_d3d11_opt_step(dev, node, true);
             return;
         case GGML_OP_SILU_BACK:
-            ggml_d3d12_silu_back(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_silu_back(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_REPEAT_BACK:
-            ggml_d3d12_repeat_back(dev, node->src[0], node);
+            ggml_d3d11_repeat_back(dev, node->src[0], node);
             return;
         case GGML_OP_RMS_NORM_BACK:
-            ggml_d3d12_rms_norm_back(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_rms_norm_back(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_SOFT_MAX_BACK:
-            ggml_d3d12_soft_max_back(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_soft_max_back(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_CROSS_ENTROPY_LOSS:
-            ggml_d3d12_cross_entropy_loss(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_cross_entropy_loss(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-            ggml_d3d12_cross_entropy_loss_back(dev, node);
+            ggml_d3d11_cross_entropy_loss_back(dev, node);
             return;
         case GGML_OP_IM2COL_BACK:
-            ggml_d3d12_im2col_back(dev, node);
+            ggml_d3d11_im2col_back(dev, node);
             return;
         case GGML_OP_GET_ROWS_BACK:
-            ggml_d3d12_get_rows_back(dev, node);
+            ggml_d3d11_get_rows_back(dev, node);
             return;
         case GGML_OP_GLU:
-            ggml_d3d12_glu(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_glu(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_UNARY:
         case GGML_OP_CLAMP:
@@ -3332,25 +3446,25 @@ static void ggml_d3d12_encode_node(d3d12_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_LOG:
         case GGML_OP_SIN:
         case GGML_OP_COS:
-            ggml_d3d12_unary(dev, node->src[0], node);
+            ggml_d3d11_unary(dev, node->src[0], node);
             return;
         case GGML_OP_GET_ROWS:
-            ggml_d3d12_get_rows(dev, node->src[0], node->src[1], node);
+            ggml_d3d11_get_rows(dev, node->src[0], node->src[1], node);
             return;
         default:
-            GGML_ABORT("ggml_d3d12: unsupported op %s", ggml_op_name(node->op));
+            GGML_ABORT("ggml_d3d11: unsupported op %s", ggml_op_name(node->op));
     }
 }
 
 /* GGML Backend Interface */
 
-static const char * ggml_backend_d3d12_name(ggml_backend_t backend) {
-    auto * ctx = (ggml_backend_d3d12_context *) backend->context;
+static const char * ggml_backend_d3d11_name(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_d3d11_context *) backend->context;
     return ctx->name.c_str();
 }
 
-static void ggml_d3d12_print_stats(d3d12_device_ctx & dev) {
-    fprintf(stderr, "ggml_d3d12 stats [%s]: graphs %llu, nodes %llu, dispatches %llu, submits %llu (mid-graph flushes: "
+static void ggml_d3d11_print_stats(d3d11_device_ctx & dev) {
+    fprintf(stderr, "ggml_d3d11 stats [%s]: graphs %llu, nodes %llu, dispatches %llu, submits %llu (mid-graph flushes: "
                     "batch %llu, arena %llu) | graph_compute %.1f ms = encode %.1f (shader compile %.1f in %llu pipelines) + submit calls %.1f + fence wait %.1f | "
                     "set_tensor %llu calls %.1f MB %.1f ms | get_tensor %llu calls %.1f MB %.1f ms\n",
             dev.name.c_str(), (unsigned long long) dev.n_graphs, (unsigned long long) dev.n_nodes,
@@ -3362,7 +3476,7 @@ static void ggml_d3d12_print_stats(d3d12_device_ctx & dev) {
             (unsigned long long) dev.n_set_tensor, dev.bytes_set / 1e6, dev.t_set_us / 1000.0,
             (unsigned long long) dev.n_get_tensor, dev.bytes_get / 1e6, dev.t_get_us / 1000.0);
     for (const auto & r : dev.rejected) {
-        fprintf(stderr, "ggml_d3d12 rejected [%s]: %6llu x %s\n", dev.name.c_str(), (unsigned long long) r.second, r.first.c_str());
+        fprintf(stderr, "ggml_d3d11 rejected [%s]: %6llu x %s\n", dev.name.c_str(), (unsigned long long) r.second, r.first.c_str());
     }
     if (dev.profile && !dev.prof.empty()) {
         std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows(dev.prof.begin(), dev.prof.end());
@@ -3371,7 +3485,7 @@ static void ggml_d3d12_print_stats(d3d12_device_ctx & dev) {
         for (const auto & r : rows) {
             total += r.second.first;
         }
-        fprintf(stderr, "ggml_d3d12 gpu time by pipeline (total %.1f ms over %llu graphs):\n", total / 1000.0,
+        fprintf(stderr, "ggml_d3d11 gpu time by pipeline (total %.1f ms over %llu graphs):\n", total / 1000.0,
                 (unsigned long long) dev.n_graphs);
         for (const auto & r : rows) {
             fprintf(stderr, "  %9.1f ms %5.1f%% %8llu x %7.1f us  %s\n", r.second.first / 1000.0,
@@ -3382,43 +3496,43 @@ static void ggml_d3d12_print_stats(d3d12_device_ctx & dev) {
     fflush(stderr);
 }
 
-static void ggml_backend_d3d12_free(ggml_backend_t backend) {
-    auto * ctx = (ggml_backend_d3d12_context *) backend->context;
+static void ggml_backend_d3d11_free(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_d3d11_context *) backend->context;
     delete ctx;
     delete backend;
 }
 
-static ggml_status ggml_backend_d3d12_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    auto *             ctx = (ggml_backend_d3d12_context *) backend->context;
-    d3d12_device_ctx & dev = *ctx->dev;
-    D3D12_LOG_DEBUG("graph_compute(%d nodes)\n", cgraph->n_nodes);
+static ggml_status ggml_backend_d3d11_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    auto *             ctx = (ggml_backend_d3d11_context *) backend->context;
+    d3d11_device_ctx & dev = *ctx->dev;
+    D3D11_LOG_DEBUG("graph_compute(%d nodes)\n", cgraph->n_nodes);
 
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
-    const double t0 = ggml_d3d12_time_us();
-    ggml_d3d12_begin(dev, true);
+    const double t0 = ggml_d3d11_time_us();
+    ggml_d3d11_begin(dev, true);
     if (dev.n_graphs < 4 || cgraph->n_nodes != dev.last_graph_nodes) {
         // a graph of a new shape: find the pipelines it needs first and compile the missing ones in parallel
         dev.collecting = true;
         for (int i = 0; i < cgraph->n_nodes;) {
-            i += ggml_d3d12_encode_nodes(dev, cgraph, i);
+            i += ggml_d3d11_encode_nodes(dev, cgraph, i);
         }
         dev.collecting = false;
-        ggml_d3d12_build_pipeline_jobs(dev);
+        ggml_d3d11_build_pipeline_jobs(dev);
     }
     dev.last_graph_nodes = cgraph->n_nodes;
     for (int i = 0; i < cgraph->n_nodes;) {
-        i += ggml_d3d12_encode_nodes(dev, cgraph, i);
+        i += ggml_d3d11_encode_nodes(dev, cgraph, i);
     }
-    ggml_d3d12_submit_and_wait(dev);
+    ggml_d3d11_submit_and_wait(dev);
     dev.n_graphs++;
     dev.n_nodes += cgraph->n_nodes;
-    dev.t_graph_us += ggml_d3d12_time_us() - t0;
+    dev.t_graph_us += ggml_d3d11_time_us() - t0;
     return GGML_STATUS_SUCCESS;
 }
 
-static ggml_backend_i ggml_backend_d3d12_i = {
-    /* .get_name                = */ ggml_backend_d3d12_name,
-    /* .free                    = */ ggml_backend_d3d12_free,
+static ggml_backend_i ggml_backend_d3d11_i = {
+    /* .get_name                = */ ggml_backend_d3d11_name,
+    /* .free                    = */ ggml_backend_d3d11_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
@@ -3429,13 +3543,13 @@ static ggml_backend_i ggml_backend_d3d12_i = {
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
-    /* .graph_compute           = */ ggml_backend_d3d12_graph_compute,
+    /* .graph_compute           = */ ggml_backend_d3d11_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 
-static ggml_guid_t ggml_backend_d3d12_guid(void) {
+static ggml_guid_t ggml_backend_d3d11_guid(void) {
     static ggml_guid guid = { 0xd3, 0xd1, 0x2b, 0xac, 0x4e, 0x6d, 0x47, 0x1a,
                               0x9c, 0x0f, 0x8a, 0x21, 0x5b, 0x77, 0xe0, 0x39 };
     return &guid;
@@ -3443,165 +3557,145 @@ static ggml_guid_t ggml_backend_d3d12_guid(void) {
 
 /* GGML Backend Buffer Interface */
 
-static void ggml_backend_d3d12_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    auto * ctx = (ggml_backend_d3d12_buffer_context *) buffer->context;
+static void ggml_backend_d3d11_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
     delete ctx;
 }
 
-static void * ggml_backend_d3d12_buffer_get_base(ggml_backend_buffer_t buffer) {
+static void * ggml_backend_d3d11_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
-    return d3d12_ptr_base;
+    return d3d11_ptr_base;
 }
 
-static void ggml_backend_d3d12_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    auto * ctx = (ggml_backend_d3d12_buffer_context *) buffer->context;
-    ggml_d3d12_buffer_memset(*ctx->dev, ctx->va, ggml_d3d12_tensor_offset(tensor) + offset, size, value);
+static void ggml_backend_d3d11_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
+    ggml_d3d11_buffer_memset(*ctx->dev, ctx->va, ggml_d3d11_tensor_offset(tensor) + offset, size, value);
 }
 
-static void ggml_backend_d3d12_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    auto *             ctx = (ggml_backend_d3d12_buffer_context *) buffer->context;
-    d3d12_device_ctx & dev = *ctx->dev;
+static void ggml_backend_d3d11_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    auto *             ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
+    d3d11_device_ctx & dev = *ctx->dev;
     if (size == 0) {
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
-
-    if (!dev.upload_buf) {
-        dev.upload_buf = ggml_d3d12_create_buffer(dev, D3D12_STAGING_SIZE, D3D12_HEAP_TYPE_UPLOAD, L"ggml_d3d12_upload");
-        GGML_ASSERT(dev.upload_buf);
-        D3D12_RANGE no_read = { 0, 0 };
-        ggml_d3d12_check(dev.upload_buf->Map(0, &no_read, &dev.upload_ptr), "ID3D12Resource::Map (upload)");
-    }
-
-    const double t0         = ggml_d3d12_time_us();
-    const size_t dst_offset = ggml_d3d12_tensor_offset(tensor) + offset;
+    const double t0         = ggml_d3d11_time_us();
+    const size_t dst_offset = ggml_d3d11_tensor_offset(tensor) + offset;
     size_t       done       = 0;
     while (done < size) {
-        const size_t n = std::min(size - done, (size_t) D3D12_STAGING_SIZE);
-        memcpy(dev.upload_ptr, (const char *) data + done, n);
-        ggml_d3d12_begin(dev, false);
-        dev.cmd_list->CopyBufferRegion(ctx->res.get(), dst_offset + done, dev.upload_buf.get(), 0, n);
-        ggml_d3d12_submit_and_wait(dev);
+        const size_t n   = std::min(size - done, (size_t) D3D11_STAGING_SIZE);
+        D3D11_BOX    box = { (UINT) (dst_offset + done), 0, 0, (UINT) (dst_offset + done + n), 1, 1 };
+        dev.ctx->UpdateSubresource(ctx->res->buf.get(), 0, &box, (const char *) data + done, 0, 0);
         done += n;
     }
     dev.n_set_tensor++;
     dev.bytes_set += size;
-    dev.t_set_us += ggml_d3d12_time_us() - t0;
+    dev.t_set_us += ggml_d3d11_time_us() - t0;
 }
 
-static void ggml_backend_d3d12_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    auto *             ctx = (ggml_backend_d3d12_buffer_context *) buffer->context;
-    d3d12_device_ctx & dev = *ctx->dev;
+static void ggml_backend_d3d11_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    auto *             ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
+    d3d11_device_ctx & dev = *ctx->dev;
     if (size == 0) {
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(dev.mutex);
 
     if (!dev.readback_buf) {
-        dev.readback_buf = ggml_d3d12_create_buffer(dev, D3D12_STAGING_SIZE, D3D12_HEAP_TYPE_READBACK, L"ggml_d3d12_readback");
-        GGML_ASSERT(dev.readback_buf);
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth         = (UINT) D3D11_STAGING_SIZE;
+        desc.Usage             = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags    = D3D11_CPU_ACCESS_READ;
+        ggml_d3d11_check(dev.device->CreateBuffer(&desc, nullptr, dev.readback_buf.put()), "CreateBuffer (readback)");
     }
 
-    const double t0         = ggml_d3d12_time_us();
-    const size_t src_offset = ggml_d3d12_tensor_offset(tensor) + offset;
+    const double t0         = ggml_d3d11_time_us();
+    const size_t src_offset = ggml_d3d11_tensor_offset(tensor) + offset;
     size_t       done       = 0;
     while (done < size) {
-        const size_t n = std::min(size - done, (size_t) D3D12_STAGING_SIZE);
-        ggml_d3d12_begin(dev, false);
-        dev.cmd_list->CopyBufferRegion(dev.readback_buf.get(), 0, ctx->res.get(), src_offset + done, n);
-        ggml_d3d12_submit_and_wait(dev);
-
-        void *      ptr   = nullptr;
-        D3D12_RANGE range = { 0, n };
-        ggml_d3d12_check(dev.readback_buf->Map(0, &range, &ptr), "ID3D12Resource::Map (readback)");
-        memcpy((char *) data + done, ptr, n);
-        D3D12_RANGE no_write = { 0, 0 };
-        dev.readback_buf->Unmap(0, &no_write);
+        const size_t n   = std::min(size - done, (size_t) D3D11_STAGING_SIZE);
+        D3D11_BOX    box = { (UINT) (src_offset + done), 0, 0, (UINT) (src_offset + done + n), 1, 1 };
+        dev.ctx->CopySubresourceRegion(dev.readback_buf.get(), 0, 0, 0, 0, ctx->res->buf.get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        ggml_d3d11_check(dev.ctx->Map(dev.readback_buf.get(), 0, D3D11_MAP_READ, 0, &m), "Map (readback)");
+        memcpy((char *) data + done, m.pData, n);
+        dev.ctx->Unmap(dev.readback_buf.get(), 0);
+        ggml_d3d11_print_debug(dev);
         done += n;
     }
     dev.n_get_tensor++;
     dev.bytes_get += size;
-    dev.t_get_us += ggml_d3d12_time_us() - t0;
+    dev.t_get_us += ggml_d3d11_time_us() - t0;
+}
+static void ggml_backend_d3d11_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (ggml_backend_d3d11_buffer_context *) buffer->context;
+    ggml_d3d11_buffer_memset(*ctx->dev, ctx->va, 0, ctx->size, value);
 }
 
-static void ggml_backend_d3d12_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    auto * ctx = (ggml_backend_d3d12_buffer_context *) buffer->context;
-    ggml_d3d12_buffer_memset(*ctx->dev, ctx->va, 0, ctx->size, value);
-}
-
-static ggml_backend_buffer_i ggml_backend_d3d12_buffer_interface = {
-    /* .free_buffer     = */ ggml_backend_d3d12_buffer_free_buffer,
-    /* .get_base        = */ ggml_backend_d3d12_buffer_get_base,
+static ggml_backend_buffer_i ggml_backend_d3d11_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_d3d11_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_d3d11_buffer_get_base,
     /* .init_tensor     = */ NULL,
-    /* .memset_tensor   = */ ggml_backend_d3d12_buffer_memset_tensor,
-    /* .set_tensor      = */ ggml_backend_d3d12_buffer_set_tensor,
-    /* .get_tensor      = */ ggml_backend_d3d12_buffer_get_tensor,
+    /* .memset_tensor   = */ ggml_backend_d3d11_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_d3d11_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_d3d11_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ NULL,
-    /* .clear           = */ ggml_backend_d3d12_buffer_clear,
+    /* .clear           = */ ggml_backend_d3d11_buffer_clear,
     /* .reset           = */ NULL,
 };
 
 /* GGML Backend Buffer Type Interface */
 
-static const char * ggml_backend_d3d12_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    auto * dev = (d3d12_device_ctx *) buft->context;
+static const char * ggml_backend_d3d11_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    auto * dev = (d3d11_device_ctx *) buft->context;
     return dev->name.c_str();
 }
 
-static ggml_backend_buffer_t ggml_backend_d3d12_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    auto * dev = (d3d12_device_ctx *) buft->context;
+static ggml_backend_buffer_t ggml_backend_d3d11_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * dev = (d3d11_device_ctx *) buft->context;
     std::lock_guard<std::recursive_mutex> lock(dev->mutex);
 
-    const size_t alloc_size = std::max((size_t) D3D12_BINDING_ALIGNMENT,
-                                       (size + D3D12_BINDING_ALIGNMENT - 1) & ~((size_t) D3D12_BINDING_ALIGNMENT - 1))
-                              // One binding alignment of slack past the end. Quant blocks whose size is
-                              // not a multiple of 4 (iq4_nl and q4_0 are 18 bytes, q5_0 22, q5_1 24) end
-                              // mid-word, and ByteAddressBuffer.Load only reads 4-byte aligned words, so
-                              // reading the last block's tail necessarily touches a few bytes past it.
-                              // Root UAVs carry no size, so that read is unbounded rather than clamped:
-                              // the Radeon tolerates it, the MTT S80 faults and the device is removed.
-                              // Verified by removing this slack, which brings the fault straight back.
-                              + D3D12_BINDING_ALIGNMENT;
-    D3D12_LOG_DEBUG("alloc_buffer(%zu bytes)\n", alloc_size);
-
-    com_ptr<ID3D12Resource> res = ggml_d3d12_create_buffer(*dev, alloc_size, D3D12_HEAP_TYPE_DEFAULT, L"ggml_d3d12_tensor_buf");
+    // one binding alignment of slack past the end: quant blocks that end mid-word are read as whole words
+    const size_t alloc_size = std::max((size_t) D3D11_BINDING_ALIGNMENT,
+                                       (size + D3D11_BINDING_ALIGNMENT - 1) & ~((size_t) D3D11_BINDING_ALIGNMENT - 1))
+                              + D3D11_BINDING_ALIGNMENT;
+    com_ptr<d3d11_res> res = ggml_d3d11_create_buffer(*dev, alloc_size, D3D11_HEAP_TYPE_DEFAULT, nullptr);
     if (!res) {
         return nullptr;
     }
-    auto * ctx = new ggml_backend_d3d12_buffer_context();
+    auto * ctx = new ggml_backend_d3d11_buffer_context();
     ctx->res  = res;
     ctx->va   = res->GetGPUVirtualAddress();
     ctx->size = alloc_size;
-    ctx->dev = ggml_d3d12_shared_dev(dev);
-    return ggml_backend_buffer_init(buft, ggml_backend_d3d12_buffer_interface, ctx, size);
+    ctx->dev  = ggml_d3d11_shared_dev(dev);
+    return ggml_backend_buffer_init(buft, ggml_backend_d3d11_buffer_interface, ctx, size);
 }
-
-static size_t ggml_backend_d3d12_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+static size_t ggml_backend_d3d11_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return D3D12_BINDING_ALIGNMENT;
+    return D3D11_BINDING_ALIGNMENT;
 }
 
-static size_t ggml_backend_d3d12_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    auto * dev = (d3d12_device_ctx *) buft->context;
+static size_t ggml_backend_d3d11_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    auto * dev = (d3d11_device_ctx *) buft->context;
     return dev->max_alloc;
 }
 
 /* GGML Backend Device Interface */
 
-static const char * ggml_backend_d3d12_device_get_name(ggml_backend_dev_t dev) {
-    auto * ctx = (d3d12_device_ctx *) dev->context;
+static const char * ggml_backend_d3d11_device_get_name(ggml_backend_dev_t dev) {
+    auto * ctx = (d3d11_device_ctx *) dev->context;
     return ctx->name.c_str();
 }
 
-static const char * ggml_backend_d3d12_device_get_description(ggml_backend_dev_t dev) {
-    auto * ctx = (d3d12_device_ctx *) dev->context;
+static const char * ggml_backend_d3d11_device_get_description(ggml_backend_dev_t dev) {
+    auto * ctx = (d3d11_device_ctx *) dev->context;
     return ctx->desc.c_str();
 }
 
-static void ggml_backend_d3d12_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    auto * ctx = (d3d12_device_ctx *) dev->context;
+static void ggml_backend_d3d11_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    auto * ctx = (d3d11_device_ctx *) dev->context;
     *total     = ctx->caps.uma ? ctx->shared_mem : ctx->dedicated_mem;
     *free      = *total;
     com_ptr<IDXGIAdapter3> adapter3;
@@ -3621,16 +3715,16 @@ static void ggml_backend_d3d12_device_get_memory(ggml_backend_dev_t dev, size_t 
     }
 }
 
-static enum ggml_backend_dev_type ggml_backend_d3d12_device_get_type(ggml_backend_dev_t dev) {
-    auto * ctx = (d3d12_device_ctx *) dev->context;
+static enum ggml_backend_dev_type ggml_backend_d3d11_device_get_type(ggml_backend_dev_t dev) {
+    auto * ctx = (d3d11_device_ctx *) dev->context;
     return ctx->caps.uma ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
-static void ggml_backend_d3d12_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
-    props->name        = ggml_backend_d3d12_device_get_name(dev);
-    props->description = ggml_backend_d3d12_device_get_description(dev);
-    props->type        = ggml_backend_d3d12_device_get_type(dev);
-    ggml_backend_d3d12_device_get_memory(dev, &props->memory_free, &props->memory_total);
+static void ggml_backend_d3d11_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
+    props->name        = ggml_backend_d3d11_device_get_name(dev);
+    props->description = ggml_backend_d3d11_device_get_description(dev);
+    props->type        = ggml_backend_d3d11_device_get_type(dev);
+    ggml_backend_d3d11_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
@@ -3640,34 +3734,34 @@ static void ggml_backend_d3d12_device_get_props(ggml_backend_dev_t dev, struct g
     };
 }
 
-static ggml_backend_t ggml_backend_d3d12_device_init_backend(ggml_backend_dev_t dev, const char * params) {
+static ggml_backend_t ggml_backend_d3d11_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
-    auto * dev_ctx = (d3d12_device_ctx *) dev->context;
+    auto * dev_ctx = (d3d11_device_ctx *) dev->context;
 
-    auto * ctx = new ggml_backend_d3d12_context();
-    ctx->dev   = ggml_d3d12_shared_dev(dev_ctx);
+    auto * ctx = new ggml_backend_d3d11_context();
+    ctx->dev   = ggml_d3d11_shared_dev(dev_ctx);
     ctx->name  = dev_ctx->name;
 
     auto * backend = new ggml_backend();
     *backend       = {
-        /* .guid      = */ ggml_backend_d3d12_guid(),
-        /* .interface = */ ggml_backend_d3d12_i,
+        /* .guid      = */ ggml_backend_d3d11_guid(),
+        /* .interface = */ ggml_backend_d3d11_i,
         /* .device    = */ dev,
         /* .context   = */ ctx,
     };
     return backend;
 }
 
-static ggml_backend_buffer_type_t ggml_backend_d3d12_device_get_buffer_type(ggml_backend_dev_t dev) {
-    auto * ctx = (d3d12_device_ctx *) dev->context;
+static ggml_backend_buffer_type_t ggml_backend_d3d11_device_get_buffer_type(ggml_backend_dev_t dev) {
+    auto * ctx = (d3d11_device_ctx *) dev->context;
     return &ctx->buft;
 }
 
-static bool ggml_backend_d3d12_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_d3d12_buffer_type_get_name && buft->device == dev;
+static bool ggml_backend_d3d11_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_d3d11_buffer_type_get_name && buft->device == dev;
 }
 
-static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * op) {
+static bool ggml_d3d11_supports_op(d3d11_device_ctx * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
@@ -3717,7 +3811,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             {
                 // mat-vec kernel, any column count in chunks of 4; contiguous rows required
                 const bool quant = ggml_is_quantized(src0->type);
-                return ggml_d3d12_mul_mat_vec_type(src0->type) &&
+                return ggml_d3d11_mul_mat_vec_type(src0->type) &&
                        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        (quant ? src0->ne[0] % 256 == 0 || (src0->ne[0] % 32 == 0 && ggml_blck_size(src0->type) == 32)
@@ -3862,7 +3956,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
             {
                 const ggml_tensor * ids = op->src[2];
                 const bool quant = ggml_is_quantized(src0->type);
-                return ggml_d3d12_mul_mat_vec_type(src0->type) && src1->type == GGML_TYPE_F32 &&
+                return ggml_d3d11_mul_mat_vec_type(src0->type) && src1->type == GGML_TYPE_F32 &&
                        op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) &&
                        (quant ? src0->ne[0] % 256 == 0 || (src0->ne[0] % 32 == 0 && ggml_blck_size(src0->type) == 32)
@@ -4114,7 +4208,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                     return false;
             }
         case GGML_OP_UNARY:
-            return ggml_d3d12_unary_supported(ggml_get_unary_op(op)) && src0->type == op->type &&
+            return ggml_d3d11_unary_supported(ggml_get_unary_op(op)) && src0->type == op->type &&
                    (op->type == GGML_TYPE_F32 || (op->type == GGML_TYPE_F16 && ctx->caps.native_16bit));
         case GGML_OP_CLAMP:
         case GGML_OP_SQR:
@@ -4136,7 +4230,7 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
                     return op->type == GGML_TYPE_I32;
                 default:
                     // quantized sources go through the dequant paths of the matrix-vector kernel
-                    return ggml_is_quantized(src0->type) && ggml_d3d12_mul_mat_vec_type(src0->type) &&
+                    return ggml_is_quantized(src0->type) && ggml_d3d11_mul_mat_vec_type(src0->type) &&
                            op->type == GGML_TYPE_F32 && op->ne[0] % ggml_blck_size(src0->type) == 0;
             }
         default:
@@ -4144,9 +4238,17 @@ static bool ggml_d3d12_supports_op(d3d12_device_ctx * ctx, const ggml_tensor * o
     }
 }
 
-static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    auto *     ctx = (d3d12_device_ctx *) dev->context;
-    const bool ok  = ggml_d3d12_supports_op(ctx, op);
+static bool ggml_backend_d3d11_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    auto *     ctx = (d3d11_device_ctx *) dev->context;
+    // iq1_s comes out wrong from FXC at every optimization level that fits the register limit
+    bool iq1_s = op->type == GGML_TYPE_IQ1_S;
+    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
+        iq1_s = iq1_s || op->src[i]->type == GGML_TYPE_IQ1_S;
+    }
+    // AMD (R9700): flash attention with V head size >= 192 gives wrong values; the same DXBC is right on
+    // Intel and the MTT S80, and /Od or unrolled loops did not fix it
+    const bool amd_fa = ctx->vendor_id == 0x1002 && op->op == GGML_OP_FLASH_ATTN_EXT && op->src[2]->ne[0] >= 192;
+    const bool ok  = !iq1_s && !amd_fa && ggml_d3d11_supports_op(ctx, op);
     if (!ok && ctx->stats) {
         std::string key = ggml_op_desc(op);
         for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
@@ -4160,18 +4262,18 @@ static bool ggml_backend_d3d12_device_supports_op(ggml_backend_dev_t dev, const 
     return ok;
 }
 
-static struct ggml_backend_device_i ggml_backend_d3d12_device_i = {
-    /* .get_name             = */ ggml_backend_d3d12_device_get_name,
-    /* .get_description      = */ ggml_backend_d3d12_device_get_description,
-    /* .get_memory           = */ ggml_backend_d3d12_device_get_memory,
-    /* .get_type             = */ ggml_backend_d3d12_device_get_type,
-    /* .get_props            = */ ggml_backend_d3d12_device_get_props,
-    /* .init_backend         = */ ggml_backend_d3d12_device_init_backend,
-    /* .get_buffer_type      = */ ggml_backend_d3d12_device_get_buffer_type,
+static struct ggml_backend_device_i ggml_backend_d3d11_device_i = {
+    /* .get_name             = */ ggml_backend_d3d11_device_get_name,
+    /* .get_description      = */ ggml_backend_d3d11_device_get_description,
+    /* .get_memory           = */ ggml_backend_d3d11_device_get_memory,
+    /* .get_type             = */ ggml_backend_d3d11_device_get_type,
+    /* .get_props            = */ ggml_backend_d3d11_device_get_props,
+    /* .init_backend         = */ ggml_backend_d3d11_device_init_backend,
+    /* .get_buffer_type      = */ ggml_backend_d3d11_device_get_buffer_type,
     /* .get_host_buffer_type = */ NULL,
     /* .buffer_from_host_ptr = */ NULL,
-    /* .supports_op          = */ ggml_backend_d3d12_device_supports_op,
-    /* .supports_buft        = */ ggml_backend_d3d12_device_supports_buft,
+    /* .supports_op          = */ ggml_backend_d3d11_device_supports_op,
+    /* .supports_buft        = */ ggml_backend_d3d11_device_supports_buft,
     /* .offload_op           = */ NULL,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
@@ -4180,230 +4282,106 @@ static struct ggml_backend_device_i ggml_backend_d3d12_device_i = {
 
 /* Registry: adapter enumeration and device initialization */
 
-struct ggml_backend_d3d12_reg_context {
-    std::vector<std::shared_ptr<d3d12_device_ctx>> devs;
+struct ggml_backend_d3d11_reg_context {
+    std::vector<std::shared_ptr<d3d11_device_ctx>> devs;
     std::vector<ggml_backend_device>               devices;
 };
 
-static ggml_backend_d3d12_reg_context * g_reg_ctx = nullptr;
+static ggml_backend_d3d11_reg_context * g_reg_ctx = nullptr;
 
-static void ggml_d3d12_atexit() {
+static void ggml_d3d11_atexit() {
     if (!g_reg_ctx) {
         return;
     }
     for (auto & dev : g_reg_ctx->devs) {
         if (dev->stats) {
-            ggml_d3d12_print_stats(*dev);
+            ggml_d3d11_print_stats(*dev);
         }
     }
 }
 
-static std::shared_ptr<d3d12_device_ctx> ggml_d3d12_shared_dev(d3d12_device_ctx * dev) {
+static std::shared_ptr<d3d11_device_ctx> ggml_d3d11_shared_dev(d3d11_device_ctx * dev) {
     for (auto & d : g_reg_ctx->devs) {
         if (d.get() == dev) {
             return d;
         }
     }
-    GGML_ABORT("ggml_d3d12: unknown device context");
+    GGML_ABORT("ggml_d3d11: unknown device context");
 }
 
 // Loads a DLL from the folder this backend DLL sits in, then from the normal search path. An application
 // that loads the backend from a folder of its own (LM Studio, for one) does not put that folder on the DLL
-// search path, so dxcompiler.dll and dxil.dll next to ggml-d3d12.dll would otherwise not be found.
-static HMODULE ggml_d3d12_load_beside(const wchar_t * name) {
-    HMODULE self = nullptr;
-    wchar_t path[MAX_PATH];
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR) &ggml_d3d12_load_beside, &self)) {
-        const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
-        if (n > 0 && n < MAX_PATH) {
-            std::wstring file = path;
-            file = file.substr(0, file.find_last_of(L"\\/") + 1) + name;
-            if (HMODULE h = LoadLibraryExW(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
-                return h;
-            }
-        }
+// search path, so dxcompiler.dll and dxil.dll next to ggml-d3d11.dll would otherwise not be found.
+static bool ggml_d3d11_init_device(d3d11_device_ctx & dev, ggml_backend_dev_t ggml_dev) {
+    static std::once_flag prewarm_once;
+    std::call_once(prewarm_once, ggml_d3d11_prewarm);
+    D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {};
+    if (SUCCEEDED(dev.device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2)))) {
+        dev.caps.uma = o2.UnifiedMemoryArchitecture;
     }
-    return LoadLibraryW(name);
-}
-
-static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t ggml_dev) {
-    HRESULT hr;
-
-    // capabilities
-    D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_7 };
-    while (FAILED(dev.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
-           sm.HighestShaderModel > D3D_SHADER_MODEL_6_0) {
-        sm.HighestShaderModel = (D3D_SHADER_MODEL) (sm.HighestShaderModel - 1);
-    }
-    dev.caps.shader_model = sm.HighestShaderModel;
-    if (const char * env = getenv("GGML_D3D12_SM")) {
-        // e.g. GGML_D3D12_SM=60 caps the shader model used for kernels
-        int v = atoi(env);
-        if (v >= 60 && v <= 67) {
-            D3D_SHADER_MODEL capped = (D3D_SHADER_MODEL) (0x60 + (v - 60));
-            dev.caps.shader_model   = std::min(dev.caps.shader_model, capped);
-        }
-    }
-    if (dev.caps.shader_model < D3D_SHADER_MODEL_6_0) {
-        GGML_LOG_WARN("ggml_d3d12: %s does not support shader model 6.0, skipping\n", dev.desc.c_str());
-        return false;
-    }
-
-    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
-    if (SUCCEEDED(dev.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1)))) {
-        dev.caps.wave_ops = o1.WaveOps;
-        dev.caps.wave_min = o1.WaveLaneCountMin;
-        dev.caps.wave_max = o1.WaveLaneCountMax;
-    }
-    D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
-    if (SUCCEEDED(dev.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4)))) {
-        dev.caps.native_16bit = o4.Native16BitShaderOpsSupported && dev.caps.shader_model >= D3D_SHADER_MODEL_6_2;
-    }
-    D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
-    if (SUCCEEDED(dev.device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch)))) {
-        dev.caps.uma = arch.UMA;
-    }
-    if (const char * env = getenv("GGML_D3D12_MAX_ALLOC_MB")) {
+    dev.max_uavs = dev.device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1 ? D3D11_MAX_ROOT_UAVS : 8;
+    if (const char * env = getenv("GGML_D3D11_MAX_ALLOC_MB")) {
         dev.max_alloc = (size_t) atoll(env) * 1024 * 1024;
     }
-    if (const char * env = getenv("GGML_D3D12_SUBMIT_BATCH")) {
+    if (const char * env = getenv("GGML_D3D11_SUBMIT_BATCH")) {
         dev.submit_batch = std::max(1, atoi(env));
     }
-    if (getenv("GGML_D3D12_NO_FUSE") != nullptr) {
+    // the test runner passes only GGML_D3D12_* variables, so these two are read under both names
+    if (getenv("GGML_D3D11_NO_FUSE") != nullptr || getenv("GGML_D3D12_NO_FUSE") != nullptr) {
         dev.no_fuse = true;
     }
-    if (const char * env = getenv("GGML_D3D12_MM_TPR")) {
+    // fixed flash attention work budget per submission (no adaptation); for tests of the chunked path
+    if (const char * env = getenv("GGML_D3D11_FA_WORK")) {
+        dev.fa_work       = std::max<uint64_t>(1, strtoull(env, nullptr, 10));
+        dev.fa_work_fixed = true;
+    }
+    if (const char * env = getenv("GGML_D3D11_MM_TPR")) {
         dev.mm_tpr_max = (uint32_t) std::max(1, atoi(env));
     }
-    if (const char * env = getenv("GGML_D3D12_TILED")) {
-        // column count from which the tiled prompt kernel takes over; 1 means "always when eligible"
+    if (const char * env = getenv("GGML_D3D11_TILED")) {
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
     }
-    if (const char * env = getenv("GGML_D3D12_DISABLE_OPS")) {
+    const char * disable_ops = getenv("GGML_D3D11_DISABLE_OPS") ? getenv("GGML_D3D11_DISABLE_OPS") : getenv("GGML_D3D12_DISABLE_OPS");
+    if (const char * env = disable_ops) {
         dev.disable_ops = std::string(",") + env + ",";
-        // the runner cannot pass commas, so dots separate names too; ALL refuses every op (CPU only)
         for (char & c : dev.disable_ops) {
             if (c == '.') { c = ','; }
         }
     }
-#ifdef GGML_D3D12_FORCE_NO_BARRIER
-    if (true) {
-#else
-    if (getenv("GGML_D3D12_NO_BARRIER") != nullptr) {
-#endif
-        // timing experiments only: without UAV barriers dependent dispatches overlap and results are garbage
-        dev.no_barrier = true;
-        GGML_LOG_WARN("ggml_d3d12: GGML_D3D12_NO_BARRIER set, results will be wrong\n");
-    }
-    // queue, allocator, command list, fence
-    D3D12_COMMAND_QUEUE_DESC qdesc = {};
-    qdesc.Type                     = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qdesc.Priority                 = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    qdesc.Flags                    = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    hr = dev.device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(dev.queue.put()));
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateCommandQueue failed 0x%08lx\n", (unsigned long) hr); return false; }
-    hr = dev.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(dev.allocator.put()));
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateCommandAllocator failed 0x%08lx\n", (unsigned long) hr); return false; }
-    hr = dev.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, dev.allocator.get(), nullptr, IID_PPV_ARGS(dev.cmd_list.put()));
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateCommandList failed 0x%08lx\n", (unsigned long) hr); return false; }
-    dev.cmd_list->Close();
-    // the names come back in the DRED breadcrumbs
-    dev.queue->SetName(L"ggml_d3d12_queue");
-    dev.cmd_list->SetName(L"ggml_d3d12_list");
-    hr = dev.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(dev.fence.put()));
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateFence failed 0x%08lx\n", (unsigned long) hr); return false; }
-    dev.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    GGML_ASSERT(dev.fence_event);
 
-    // root signature: b0 = params CBV, u0..u11 = raw buffer UAVs
-    D3D12_ROOT_PARAMETER root_params[1 + D3D12_MAX_ROOT_UAVS] = {};
-    root_params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    root_params[0].Descriptor.ShaderRegister = 0;
-    root_params[0].Descriptor.RegisterSpace  = 0;
-    root_params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
-    for (int i = 0; i < D3D12_MAX_ROOT_UAVS; i++) {
-        root_params[1 + i].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        root_params[1 + i].Descriptor.ShaderRegister = i;
-        root_params[1 + i].Descriptor.RegisterSpace  = 0;
-        root_params[1 + i].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+    if (getenv("GGML_D3D11_DEBUG") != nullptr) {
+        dev.device->QueryInterface(IID_PPV_ARGS(dev.info.put()));
     }
-    D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
-    rs_desc.NumParameters             = 1 + D3D12_MAX_ROOT_UAVS;
-    rs_desc.pParameters               = root_params;
-    rs_desc.Flags                     = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-    com_ptr<ID3DBlob> rs_blob, rs_err;
-    hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, rs_blob.put(), rs_err.put());
-    if (FAILED(hr)) {
-        GGML_LOG_ERROR("ggml_d3d12: D3D12SerializeRootSignature failed: %s\n",
-                       rs_err ? (const char *) rs_err->GetBufferPointer() : "");
+    D3D11_BUFFER_DESC cb = {};
+    cb.ByteWidth         = D3D11_PARAM_SLOT_SIZE;
+    cb.Usage             = D3D11_USAGE_DYNAMIC;
+    cb.BindFlags         = D3D11_BIND_CONSTANT_BUFFER;
+    cb.CPUAccessFlags    = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(dev.device->CreateBuffer(&cb, nullptr, dev.cbuf.put()))) {
+        GGML_LOG_ERROR("ggml_d3d11: CreateBuffer (params) failed\n");
         return false;
     }
-    hr = dev.device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(dev.root_sig.put()));
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: CreateRootSignature failed 0x%08lx\n", (unsigned long) hr); return false; }
-
-    // parameter arena
-    dev.param_buf = ggml_d3d12_create_buffer(dev, (size_t) D3D12_PARAM_SLOT_SIZE * D3D12_PARAM_SLOT_COUNT,
-                                             D3D12_HEAP_TYPE_UPLOAD, L"ggml_d3d12_params");
-    if (!dev.param_buf) { return false; }
-    D3D12_RANGE no_read = { 0, 0 };
-    void * ptr = nullptr;
-    hr = dev.param_buf->Map(0, &no_read, &ptr);
-    if (FAILED(hr)) { GGML_LOG_ERROR("ggml_d3d12: Map (params) failed 0x%08lx\n", (unsigned long) hr); return false; }
-    dev.param_ptr = (uint8_t *) ptr;
-    dev.param_va  = dev.param_buf->GetGPUVirtualAddress();
-
-    // shader compiler: dxcompiler.dll + dxil.dll next to this DLL, next to the executable or on PATH.
-    // dxil.dll goes first so that dxcompiler finds it already loaded instead of searching for it itself.
-    const bool have_dxil = GetModuleHandleA("dxil.dll") || ggml_d3d12_load_beside(L"dxil.dll");
-    dev.dxc_module = ggml_d3d12_load_beside(L"dxcompiler.dll");
-    if (!dev.dxc_module) {
-        GGML_LOG_ERROR("ggml_d3d12: dxcompiler.dll not found (place dxcompiler.dll and dxil.dll next to ggml-d3d12.dll)\n");
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    if (FAILED(dev.device->CreateQuery(&qd, dev.done_query.put()))) {
+        GGML_LOG_ERROR("ggml_d3d11: CreateQuery failed\n");
         return false;
     }
-    auto create = (DxcCreateInstanceProc) (void *) GetProcAddress(dev.dxc_module, "DxcCreateInstance");
-    if (!create || FAILED(create(CLSID_DxcCompiler, IID_PPV_ARGS(dev.compiler.put()))) ||
-        FAILED(create(CLSID_DxcUtils, IID_PPV_ARGS(dev.utils.put())))) {
-        GGML_LOG_ERROR("ggml_d3d12: failed to create DXC compiler instance\n");
-        return false;
-    }
-    if (!have_dxil) {
-        GGML_LOG_WARN("ggml_d3d12: dxil.dll not found; shaders will be unsigned and most drivers reject them\n");
-    }
 
-    // stats and GPU timestamp profiling (needs the queue)
-    dev.stats   = getenv("GGML_D3D12_STATS") != nullptr;
-    dev.profile = getenv("GGML_D3D12_PROFILE") != nullptr;
-    if (dev.profile) {
-        dev.stats = true;
-        D3D12_QUERY_HEAP_DESC qh = {};
-        qh.Type                  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count                 = D3D12_QUERY_CAPACITY;
-        if (FAILED(dev.device->CreateQueryHeap(&qh, IID_PPV_ARGS(dev.query_heap.put()))) ||
-            FAILED(dev.queue->GetTimestampFrequency(&dev.timestamp_freq))) {
-            GGML_LOG_WARN("ggml_d3d12: timestamp queries unavailable, profiling disabled\n");
-            dev.profile = false;
-        } else {
-            dev.query_readback = ggml_d3d12_create_buffer(dev, (size_t) D3D12_QUERY_CAPACITY * sizeof(uint64_t),
-                                                          D3D12_HEAP_TYPE_READBACK, L"ggml_d3d12_queries");
-            dev.profile = (bool) dev.query_readback;
-        }
-    }
+    dev.stats = getenv("GGML_D3D11_STATS") != nullptr;
     if (dev.stats) {
         static bool registered = false;
         if (!registered) {
             registered = true;
-            atexit(ggml_d3d12_atexit);
+            atexit(ggml_d3d11_atexit);
         }
     }
 
-    // buffer type
     dev.buft = {
         /* .iface = */ {
-            /* .get_name       = */ ggml_backend_d3d12_buffer_type_get_name,
-            /* .alloc_buffer   = */ ggml_backend_d3d12_buffer_type_alloc_buffer,
-            /* .get_alignment  = */ ggml_backend_d3d12_buffer_type_get_alignment,
-            /* .get_max_size   = */ ggml_backend_d3d12_buffer_type_get_max_size,
+            /* .get_name       = */ ggml_backend_d3d11_buffer_type_get_name,
+            /* .alloc_buffer   = */ ggml_backend_d3d11_buffer_type_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_d3d11_buffer_type_get_alignment,
+            /* .get_max_size   = */ ggml_backend_d3d11_buffer_type_get_max_size,
             /* .get_alloc_size = */ NULL,
             /* .is_host        = */ NULL,
         },
@@ -4411,60 +4389,34 @@ static bool ggml_d3d12_init_device(d3d12_device_ctx & dev, ggml_backend_dev_t gg
         /* .context = */ &dev,
     };
 
-    GGML_LOG_INFO("ggml_d3d12: %s = %s | SM %d.%d | 16-bit %s | wave %u-%u | %s | %zu MiB | build %s %s\n", dev.name.c_str(),
-                  dev.desc.c_str(), dev.caps.shader_model >> 4, dev.caps.shader_model & 0xf,
-                  dev.caps.native_16bit ? "yes" : "no", dev.caps.wave_min, dev.caps.wave_max,
+    GGML_LOG_INFO("ggml_d3d11: %s = %s | feature level %x | %u UAVs | %s | %zu MiB | build %s %s\n", dev.name.c_str(),
+                  dev.desc.c_str(), (unsigned) dev.device->GetFeatureLevel(), dev.max_uavs,
                   dev.caps.uma ? "UMA" : "discrete", (dev.caps.uma ? dev.shared_mem : dev.dedicated_mem) / (1024 * 1024),
                   __DATE__, __TIME__);
     return true;
 }
 
-static void ggml_d3d12_enumerate(ggml_backend_d3d12_reg_context & reg_ctx, ggml_backend_reg_t reg) {
-    UINT factory_flags = 0;
-    if (getenv("GGML_D3D12_DEBUG") != nullptr) {
-        com_ptr<ID3D12Debug> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(debug.put())))) {
-            debug->EnableDebugLayer();
-            factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
-            GGML_LOG_INFO("ggml_d3d12: debug layer enabled\n");
-        } else {
-            GGML_LOG_WARN("ggml_d3d12: debug layer requested but unavailable (install the Graphics Tools feature)\n");
-        }
+static void ggml_d3d11_enumerate(ggml_backend_d3d11_reg_context & reg_ctx, ggml_backend_reg_t reg) {
+    // off unless asked for, so that a box with both backends keeps running D3D12 alone.
+    // GGML_D3D12_DISABLE turns it on too: with D3D12 off, D3D11 takes its place.
+    if (getenv("GGML_D3D11_ENABLE") == nullptr && getenv("GGML_D3D12_DISABLE") == nullptr) {
+        return;
     }
-    const bool allow_warp = getenv("GGML_D3D12_WARP") != nullptr;
-    const bool verbose    = getenv("GGML_D3D12_DEBUG") != nullptr;
-
-    // DRED has to be turned on before the device is created, and it is per process, not per device.
-    // A build with GGML_D3D12_DRED_DEFAULT has it on without the variable, for first runs on new hardware.
-#ifdef GGML_D3D12_DRED_DEFAULT
-    const bool dred_on = true;
-#else
-    const bool dred_on = getenv("GGML_D3D12_DRED") != nullptr;
-#endif
-    if (dred_on) {
-        com_ptr<ID3D12DeviceRemovedExtendedDataSettings> dred;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(dred.put())))) {
-            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            GGML_LOG_INFO("ggml_d3d12: DRED enabled\n");
-        } else {
-            GGML_LOG_WARN("ggml_d3d12: DRED requested but unavailable\n");
-        }
+    if (getenv("GGML_D3D11_DISABLE") != nullptr) {
+        return;
     }
+    const bool debug      = getenv("GGML_D3D11_DEBUG") != nullptr;
+    const bool allow_warp = getenv("GGML_D3D11_WARP") != nullptr;
 
-    com_ptr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory2(factory_flags, IID_PPV_ARGS(factory.put())))) {
-        GGML_LOG_WARN("ggml_d3d12: CreateDXGIFactory2 failed\n");
+    com_ptr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
+        GGML_LOG_WARN("ggml_d3d11: CreateDXGIFactory1 failed\n");
         return;
     }
     com_ptr<IDXGIFactory6> factory6;
     factory->QueryInterface(IID_PPV_ARGS(factory6.put()));
 
     std::vector<com_ptr<IDXGIAdapter1>> adapters;
-    if (getenv("GGML_D3D12_DISABLE") != nullptr) {
-        GGML_LOG_WARN("ggml_d3d12: GGML_D3D12_DISABLE set, exposing no devices\n");
-        return;
-    }
     for (UINT i = 0;; i++) {
         com_ptr<IDXGIAdapter1> adapter;
         HRESULT hr;
@@ -4478,140 +4430,121 @@ static void ggml_d3d12_enumerate(ggml_backend_d3d12_reg_context & reg_ctx, ggml_
         }
         adapters.push_back(adapter);
     }
-    // GGML_D3D12_ONLY=<text>: expose only the adapters whose name contains <text>. With an iGPU and a dGPU in one
-    // box, llama.cpp runs on the dGPU alone and test-backend-ops -b D3D120 tests only the first adapter; this picks
-    // which GPU gets exercised without changing the command line.
-    if (const char * only = getenv("GGML_D3D12_ONLY")) {
+    if (const char * only = getenv("GGML_D3D11_ONLY")) {
         std::vector<com_ptr<IDXGIAdapter1>> kept;
         for (auto & adapter : adapters) {
             DXGI_ADAPTER_DESC1 desc = {};
             adapter->GetDesc1(&desc);
-            if (ggml_d3d12_wide_to_utf8(desc.Description).find(only) != std::string::npos) {
+            if (ggml_d3d11_wide_to_utf8(desc.Description).find(only) != std::string::npos) {
                 kept.push_back(adapter);
             }
         }
         adapters = std::move(kept);
     }
 
-    // first pass: create the D3D12 devices, so device contexts are stable before ggml devices point at them
-    size_t n_skipped = 0;
     for (auto & adapter : adapters) {
         DXGI_ADAPTER_DESC1 desc = {};
         adapter->GetDesc1(&desc);
         if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && !allow_warp) {
-            if (verbose) {
-                GGML_LOG_INFO("ggml_d3d12: skipped %s - software adapter, set GGML_D3D12_WARP=1 to use it\n",
-                              ggml_d3d12_wide_to_utf8(desc.Description).c_str());
-            }
-            n_skipped++;
             continue;
         }
-        auto dev = std::make_shared<d3d12_device_ctx>();
-        const HRESULT hr_dev = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(dev->device.put()));
-        if (FAILED(hr_dev)) {
-            if (verbose) {
-                GGML_LOG_INFO("ggml_d3d12: skipped %s - no D3D12 feature level 11_0 device (0x%08x)\n",
-                              ggml_d3d12_wide_to_utf8(desc.Description).c_str(), (unsigned) hr_dev);
-            }
-            n_skipped++;
+        auto dev = std::make_shared<d3d11_device_ctx>();
+        const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+        UINT flags = debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
+        HRESULT hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2,
+                                       D3D11_SDK_VERSION, dev->device.put(), nullptr, dev->ctx.put());
+        if (FAILED(hr) && debug) {
+            GGML_LOG_WARN("ggml_d3d11: debug layer unavailable (install the Graphics Tools feature)\n");
+            flags = 0;
+            hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2,
+                                   D3D11_SDK_VERSION, dev->device.put(), nullptr, dev->ctx.put());
+        }
+        if (FAILED(hr)) {
+            // Windows without the 11.1 runtime rejects the list that names 11_1
+            hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels + 1, 1,
+                                   D3D11_SDK_VERSION, dev->device.put(), nullptr, dev->ctx.put());
+        }
+        if (FAILED(hr)) {
+            GGML_LOG_INFO("ggml_d3d11: skipped %s - no feature level 11_0 device (0x%08x)\n",
+                          ggml_d3d11_wide_to_utf8(desc.Description).c_str(), (unsigned) hr);
             continue;
         }
         dev->adapter       = adapter;
-        dev->dred          = dred_on;
-        dev->desc          = ggml_d3d12_wide_to_utf8(desc.Description);
+        dev->desc          = ggml_d3d11_wide_to_utf8(desc.Description);
         dev->vendor_id     = desc.VendorId;
         dev->dedicated_mem = desc.DedicatedVideoMemory;
         dev->shared_mem    = desc.SharedSystemMemory;
-        dev->name          = GGML_D3D12_NAME + std::to_string(reg_ctx.devs.size());
+        dev->name          = GGML_D3D11_NAME + std::to_string(reg_ctx.devs.size());
         reg_ctx.devs.push_back(dev);
     }
 
-    // the one case worth a warning without any switch being set: the user has adapters but ends up with
-    // no device and no reason why. GGML_D3D12_DEBUG=1 then names each one and says what was wrong with it.
-    if (reg_ctx.devs.empty() && n_skipped > 0) {
-        GGML_LOG_WARN("ggml_d3d12: no usable device - %zu adapter(s) rejected, set GGML_D3D12_DEBUG=1 for the reason\n",
-                      n_skipped);
-    }
-
     reg_ctx.devices.reserve(reg_ctx.devs.size());
-    std::vector<std::shared_ptr<d3d12_device_ctx>> kept;
+    std::vector<std::shared_ptr<d3d11_device_ctx>> kept;
     for (auto & dev : reg_ctx.devs) {
         ggml_backend_device ggml_dev = {
-            /* .iface   = */ ggml_backend_d3d12_device_i,
+            /* .iface   = */ ggml_backend_d3d11_device_i,
             /* .reg     = */ reg,
             /* .context = */ dev.get(),
         };
         reg_ctx.devices.push_back(ggml_dev);
-        if (!ggml_d3d12_init_device(*dev, &reg_ctx.devices.back())) {
+        if (!ggml_d3d11_init_device(*dev, &reg_ctx.devices.back())) {
             reg_ctx.devices.pop_back();
             continue;
         }
         kept.push_back(dev);
     }
     reg_ctx.devs = std::move(kept);
-    // renumber after drops
     for (size_t i = 0; i < reg_ctx.devs.size(); i++) {
-        reg_ctx.devs[i]->name = GGML_D3D12_NAME + std::to_string(i);
+        reg_ctx.devs[i]->name = GGML_D3D11_NAME + std::to_string(i);
     }
 }
-
-static const char * ggml_backend_d3d12_reg_get_name(ggml_backend_reg_t reg) {
+static const char * ggml_backend_d3d11_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
-    return GGML_D3D12_NAME;
+    return GGML_D3D11_NAME;
 }
 
-static size_t ggml_backend_d3d12_reg_get_device_count(ggml_backend_reg_t reg) {
-    auto * ctx = (ggml_backend_d3d12_reg_context *) reg->context;
+static size_t ggml_backend_d3d11_reg_get_device_count(ggml_backend_reg_t reg) {
+    auto * ctx = (ggml_backend_d3d11_reg_context *) reg->context;
     return ctx->devices.size();
 }
 
-static ggml_backend_dev_t ggml_backend_d3d12_reg_get_device(ggml_backend_reg_t reg, size_t index) {
-    auto * ctx = (ggml_backend_d3d12_reg_context *) reg->context;
+static ggml_backend_dev_t ggml_backend_d3d11_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    auto * ctx = (ggml_backend_d3d11_reg_context *) reg->context;
     GGML_ASSERT(index < ctx->devices.size());
     return &ctx->devices[index];
 }
 
-static const struct ggml_backend_reg_i ggml_backend_d3d12_reg_i = {
-    /* .get_name         = */ ggml_backend_d3d12_reg_get_name,
-    /* .get_device_count = */ ggml_backend_d3d12_reg_get_device_count,
-    /* .get_device       = */ ggml_backend_d3d12_reg_get_device,
+static const struct ggml_backend_reg_i ggml_backend_d3d11_reg_i = {
+    /* .get_name         = */ ggml_backend_d3d11_reg_get_name,
+    /* .get_device_count = */ ggml_backend_d3d11_reg_get_device_count,
+    /* .get_device       = */ ggml_backend_d3d11_reg_get_device,
     /* .get_proc_address = */ NULL,
 };
 
-ggml_backend_reg_t ggml_backend_d3d12_reg() {
+ggml_backend_reg_t ggml_backend_d3d11_reg() {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    // leaked on purpose: D3D12 objects must not be torn down during static destruction
+    // leaked on purpose: D3D11 objects must not be torn down during static destruction
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
-        /* .iface       = */ ggml_backend_d3d12_reg_i,
+        /* .iface       = */ ggml_backend_d3d11_reg_i,
         /* .context     = */ nullptr,
     };
     if (g_reg_ctx == nullptr) {
-        g_reg_ctx   = new ggml_backend_d3d12_reg_context();
+        g_reg_ctx   = new ggml_backend_d3d11_reg_context();
         reg.context = g_reg_ctx;
-        ggml_d3d12_enumerate(*g_reg_ctx, &reg);
+        ggml_d3d11_enumerate(*g_reg_ctx, &reg);
     }
     return &reg;
 }
 
-ggml_backend_t ggml_backend_d3d12_init(int device) {
-    ggml_backend_reg_t reg = ggml_backend_d3d12_reg();
+ggml_backend_t ggml_backend_d3d11_init(int device) {
+    ggml_backend_reg_t reg = ggml_backend_d3d11_reg();
     if (device < 0 || (size_t) device >= ggml_backend_reg_dev_count(reg)) {
         return nullptr;
     }
-    return ggml_backend_d3d12_device_init_backend(ggml_backend_reg_dev_get(reg, device), nullptr);
+    return ggml_backend_d3d11_device_init_backend(ggml_backend_reg_dev_get(reg, device), nullptr);
 }
 
-GGML_BACKEND_DL_IMPL(ggml_backend_d3d12_reg)
-
-#ifdef GGML_D3D12_VK_ALIAS
-// Drop-in for applications linked against ggml-vulkan.dll (LM Studio's engine imports only this symbol):
-// built with -DGGML_D3D12_VK_ALIAS and renamed to ggml-vulkan.dll, this DLL serves D3D12 in Vulkan's place.
-extern "C" {
-GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void) {
-    return ggml_backend_d3d12_reg();
-}
-}
-#endif
+GGML_BACKEND_DL_IMPL(ggml_backend_d3d11_reg)
